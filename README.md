@@ -204,6 +204,10 @@ it is healthy; it falls back to 0 the moment writes stop. The signal to
 worry about is a *climbing* trend across the sparkline window while writes
 continue — that means the consumer is genuinely falling behind.
 
+## License
+
+[MIT](LICENSE) © 2026 codetesla51
+
 ## Project layout
 
 | File                 | Responsibility                                                     |
