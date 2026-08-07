@@ -51,18 +51,26 @@ Built on [`jackc/pglogrepl`](https://github.com/jackc/pglogrepl) and
 ## Running it
 
 ```console
-$ go run ./cmd/phylax
-time=2026-08-07T10:50:29.045+01:00 level=INFO msg="connected for logical replication"
-time=2026-08-07T10:50:29.057+01:00 level=INFO msg="connected for administration"
-time=2026-08-07T10:50:29.058+01:00 level=INFO msg="identified system" system_id=7671172641574096939 timeline=1 start_lsn=0/1A22798 database=phy
-time=2026-08-07T10:50:29.097+01:00 level=INFO msg="replication slot ready" slot=my_slot created=true
-time=2026-08-07T10:50:29.102+01:00 level=INFO msg="publication ready" publication=my_publication created=true
-time=2026-08-07T10:50:29.104+01:00 level=INFO msg="replication started" slot=my_slot publication=my_publication start_lsn=0/1A22798
+$ go run ./cmd/phylax --dsn 'postgres://us:1@localhost:5432/phy' --tables users,orders
+{"Table":"users","Operation":"insert","OldRow":null,"NewRow":{"id":"1","name":"Alice"}}
+...
 ```
 
-The client then idles, streaming changes as they happen. Add `-v` to see
-debug-level protocol traffic (server keepalives, raw WAL records):
+Each change is printed to stdout as JSON. Add `-v` to see debug-level
+protocol traffic (server keepalives, raw WAL records):
 
 ```console
-$ go run ./cmd/phylax -v
+$ go run ./cmd/phylax --dsn 'postgres://us:1@localhost:5432/phy' --tables users,orders -v
 ```
+
+To deliver changes to an HTTP endpoint instead of stdout, pass `--webhook`:
+
+```console
+$ go run ./cmd/phylax --dsn 'postgres://us:1@localhost:5432/phy' --tables users,orders \
+    --webhook https://example.com/changes
+```
+
+The webhook receives each change as a JSON POST with up to 3 retries (1s/2s/3s
+backoff); after 3 failures the change is logged and dropped. `--slot` and
+`--publication` override the phylax defaults. SIGINT/SIGTERM shuts down
+gracefully (slot position saved, so a restart resumes where it left off).

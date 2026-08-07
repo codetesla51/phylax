@@ -1,149 +1,166 @@
-// main.go — entry point for the phylax replication client.
+// main.go — phylax CLI: a thin wrapper around the phylax.CDC API.
 //
-// The client:
-//  1. opens a replication connection and an admin connection,
-//  2. identifies the server and ensures the slot and publication exist,
-//  3. resumes streaming from the slot's saved position (or from the
-//     current WAL position for a fresh slot), logging every change.
-//
-// All the actual work lives in the phylax package; this file only wires
-// configuration and the connections together, calls into the library, and
-// drives the stream. Each step returns an error instead of printing and
-// exiting, so main decides how failures are reported.
+// It parses flags into a phylax.Config, registers a change consumer (webhook
+// POST with retry, or stdout printing), and runs the CDC client until
+// SIGINT/SIGTERM triggers a graceful shutdown.
 
 package main
 
 import (
+	"bytes"
 	"context"
-	"flag"
+	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/spf13/cobra"
 
 	"phylax"
 )
 
 func main() {
-	// -v turns on debug-level logging (server keepalives, raw WAL records).
-	verbose := flag.Bool("v", false, "enable debug-level logging (protocol traffic)")
-	flag.Parse()
-
-	level := slog.LevelInfo
-	if *verbose {
-		level = slog.LevelDebug
-	}
-
-	// Structured logging keeps operational messages readable and greppable.
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
-
-	ctx := context.Background()
-	if err := run(ctx, phylax.DefaultClientConfig(), logger); err != nil {
-		logger.Error("replication client failed", "error", err)
+	if err := newRootCmd().Execute(); err != nil {
 		os.Exit(1)
 	}
 }
 
-// run wires everything together and drives the stream until it ends.
-func run(ctx context.Context, cfg phylax.ClientConfig, logger *slog.Logger) error {
-	// 1. Open both connections: the replication connection for streaming,
-	// the admin connection for slot and publication management.
-	replConn, err := phylax.OpenReplicationConnection(ctx, cfg.DatabaseURL)
+// options holds every CLI flag.
+type options struct {
+	dsn         string
+	tables      string
+	webhook     string
+	slot        string
+	publication string
+	verbose     bool
+}
+
+func newRootCmd() *cobra.Command {
+	opts := &options{}
+
+	cmd := &cobra.Command{
+		Use:   "phylax",
+		Short: "Replicate PostgreSQL changes to a webhook or stdout",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return run(opts)
+		},
+		// Print errors without dumping usage on runtime failures; flag
+		// validation errors still show usage.
+		SilenceUsage: true,
+	}
+
+	cmd.Flags().StringVar(&opts.dsn, "dsn", "", "libpq connection string (required)")
+	cmd.Flags().StringVar(&opts.tables, "tables", "", "comma-separated tables to replicate (required)")
+	cmd.Flags().StringVar(&opts.webhook, "webhook", "", "URL to POST each change to (optional)")
+	cmd.Flags().StringVar(&opts.slot, "slot", "", "replication slot name (default: phylax.Config default)")
+	cmd.Flags().StringVar(&opts.publication, "publication", "", "publication name (default: phylax.Config default)")
+	cmd.Flags().BoolVarP(&opts.verbose, "verbose", "v", false, "enable debug-level logging")
+
+	_ = cmd.MarkFlagRequired("dsn")
+	_ = cmd.MarkFlagRequired("tables")
+
+	return cmd
+}
+
+// run builds the CDC config from flags, registers the change consumer, and
+// starts replication, shutting down gracefully on SIGINT/SIGTERM.
+func run(opts *options) error {
+	level := slog.LevelInfo
+	if opts.verbose {
+		level = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+
+	cfg := phylax.Config{
+		DSN:             opts.dsn,
+		Tables:          splitTables(opts.tables),
+		SlotName:        opts.slot,
+		PublicationName: opts.publication,
+	}
+
+	cdc, err := phylax.New(cfg)
 	if err != nil {
 		return err
 	}
-	defer replConn.Close(ctx)
-	logger.Info("connected for logical replication")
 
-	adminConn, err := phylax.OpenAdminConnection(ctx, cfg.AdminURL)
-	if err != nil {
-		return err
-	}
-	defer adminConn.Close(ctx)
-	logger.Info("connected for administration")
-
-	// 2. Ask the server where it is. Its current WAL position is the
-	// fallback start point for a slot that has no saved position yet.
-	sysIdent, err := phylax.IdentifySystem(ctx, replConn)
-	if err != nil {
-		return err
-	}
-	logger.Info("identified system",
-		"system_id", sysIdent.SystemID,
-		"timeline", sysIdent.Timeline,
-		"start_lsn", sysIdent.XLogPos.String(),
-		"database", sysIdent.DBName,
-	)
-
-	// 3. Make sure the slot and publication exist (both are idempotent).
-	slotCreated, err := phylax.EnsureReplicationSlot(ctx, replConn, adminConn, cfg.SlotName)
-	if err != nil {
-		return err
-	}
-	logger.Info("replication slot ready", "slot", cfg.SlotName, "created", slotCreated)
-
-	pubCreated, err := phylax.EnsurePublication(ctx, adminConn, cfg.PublicationName, cfg.Tables)
-	if err != nil {
-		return err
-	}
-	logger.Info("publication ready", "publication", cfg.PublicationName, "created", pubCreated)
-
-	// 4. Choose where streaming starts. A slot that has been used before
-	// remembers how far the previous run got (confirmed_flush_lsn);
-	// starting there picks up any changes made while the client was not
-	// running. A fresh slot has no saved position yet, so start from the
-	// server's current WAL position instead.
-	resumeLSN := sysIdent.XLogPos
-	if confirmed, ok, err := phylax.SlotConfirmedFlushLSN(ctx, adminConn, cfg.SlotName); err != nil {
-		return err
-	} else if ok {
-		resumeLSN = confirmed
-		logger.Info("resuming from slot's saved position", "slot", cfg.SlotName, "start_lsn", resumeLSN.String())
+	if opts.webhook != "" {
+		cdc.OnChange(webhookChangeHandler(opts.webhook))
 	} else {
-		logger.Info("fresh slot, starting from current WAL position", "slot", cfg.SlotName, "start_lsn", resumeLSN.String())
+		cdc.OnChange(func(change *phylax.Change) {
+			line, err := json.Marshal(change)
+			if err != nil {
+				slog.Error("printing change", "error", err)
+				return
+			}
+			fmt.Println(string(line))
+		})
 	}
 
-	// 5. Start streaming. Every decoded change is logged with its table,
-	// operation and row payloads.
-	stream, err := phylax.NewReplicationStream(ctx, replConn, cfg, resumeLSN, logger,
-		func(change *phylax.Change) error {
-			// Only include the row data that exists for this operation:
-			// inserts have a new row, deletes an old one, updates both.
-			attrs := []any{
-				"table", change.Table,
-				"operation", change.Operation,
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	return cdc.Start(ctx)
+}
+
+// splitTables parses a comma-separated flag value into a table list,
+// trimming whitespace and skipping empty entries.
+func splitTables(s string) []string {
+	parts := strings.Split(s, ",")
+	tables := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if t := strings.TrimSpace(part); t != "" {
+			tables = append(tables, t)
+		}
+	}
+	return tables
+}
+
+// webhookChangeHandler returns an OnChange callback that POSTs each change
+// as JSON to the webhook URL, retrying up to three times with a 1s/2s/3s
+// backoff on request errors or non-2xx responses. After three failures it
+// logs the error and drops the change.
+func webhookChangeHandler(url string) func(*phylax.Change) {
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	return func(change *phylax.Change) {
+		body, err := json.Marshal(change)
+		if err != nil {
+			slog.Error("webhook: marshaling change", "error", err)
+			return
+		}
+
+		for attempt := 1; attempt <= 3; attempt++ {
+			if err := postJSON(client, url, body); err == nil {
+				return
+			} else {
+				slog.Warn("webhook: delivery attempt failed", "attempt", attempt, "error", err)
 			}
-			if change.OldRow != nil {
-				attrs = append(attrs, "old_row", change.OldRow)
-			}
-			if change.NewRow != nil {
-				attrs = append(attrs, "new_row", change.NewRow)
-			}
-			logger.Info("change detected", attrs...)
-			return nil
-		})
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+
+		slog.Error("webhook: giving up on change after 3 attempts",
+			"table", change.Table,
+			"operation", change.Operation,
+		)
+	}
+}
+
+// postJSON sends one POST and returns an error on transport failure or a
+// non-2xx response.
+func postJSON(client *http.Client, url string, body []byte) error {
+	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
-	logger.Info("replication started",
-		"slot", cfg.SlotName,
-		"publication", cfg.PublicationName,
-		"start_lsn", resumeLSN.String(),
-	)
+	defer resp.Body.Close()
 
-	// 6. Serve decoded changes over SSE so external clients can watch the
-	// stream live. The SSE server shares the stream's broadcaster, so every
-	// change the loop decodes is also fanned out to SSE clients.
-	httpServer := &http.Server{
-		Addr:    ":8080",
-		Handler: http.HandlerFunc(phylax.NewServer(stream.Broadcaster()).NewSSEHandler),
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("unexpected status %s", resp.Status)
 	}
-	go func() {
-		logger.Info("SSE server listening", "addr", httpServer.Addr)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("SSE server failed", "error", err)
-		}
-	}()
-	defer httpServer.Close()
-
-	return stream.Run(ctx)
+	return nil
 }
