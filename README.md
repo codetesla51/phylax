@@ -8,11 +8,21 @@
 ![Go](https://img.shields.io/badge/Go-1.25-00ADD8?style=flat-square&logo=go&logoColor=white)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
 
-[Quick start](#quick-start) • [Features](#features) • [How it works](#how-it-works) • [CLI](#cli) • [Library](#library) • [Console](#console) • [Change payload](#understanding-the-change-payload) • [Performance](#performance) • [Limitations](#deliberate-limitations)
+[Quick start](#quick-start) • [Why phylax?](#why-phylax) • [Features](#features) • [How it works](#how-it-works) • [CLI](#cli) • [Library](#library) • [Console](#console) • [Change payload](#understanding-the-change-payload) • [Performance](#performance) • [Limitations](#deliberate-limitations)
 
 </div>
 
 phylax connects to PostgreSQL, creates its own replication slot and publication, and streams every row change (`insert` / `update` / `delete`) to your code in real time — to stdout, to an HTTP webhook, or to an embedded live console with SSE metrics. It reconnects with backoff, resumes from the slot's saved position, and stays out of your way.
+
+## Why phylax?
+
+Because the replication protocol is the hard part — your business logic isn't. Logical replication is the proper way to watch a database: no trigger overhead on every write, no polling latency, only committed transactions, and the server itself tracks your position. But the sharp edges are exactly where hand-rolled clients go wrong: keepalives and `wal_sender_timeout`, standby-status timing, slot and publication lifecycle, resume semantics, and what happens when a consumer is slow. phylax does all of it and hands you a `Change` callback.
+
+- **Instead of wiring pglogrepl yourself** — slot/publication provisioning, keepalive handling, reconnect with backoff, resume from the slot's LSN, and error classification are done and tested; your handler is five lines.
+- **Instead of a CDC platform** (Debezium, Kafka, …) — no JVM, no broker, no schema registry, no distributed deployment. A single small binary, or an embedded library, that delivers to your code, a webhook, or the included console.
+- **Instead of triggers or polling** — changes arrive as they commit, without touching your application code or adding write-path overhead.
+
+Not the right fit for exactly-once delivery, multi-slot HA, or frequent schema evolution — see [Deliberate limitations](#deliberate-limitations).
 
 ## Quick start
 
