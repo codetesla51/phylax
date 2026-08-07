@@ -1,0 +1,67 @@
+name: release
+
+# Runs when a version tag is pushed (v0.1.0, v1.2.3, ...):
+# tests first, then builds the CLI for the common platforms and publishes
+# a GitHub Release with the binaries + checksums attached.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+          - os: linux
+            arch: arm64
+          - os: darwin
+            arch: amd64
+          - os: darwin
+            arch: arm64
+          - os: windows
+            arch: amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: |
+          ext=""
+          [ "${{ matrix.os }}" = "windows" ] && ext=".exe"
+          mkdir -p dist
+          GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} CGO_ENABLED=0 \
+            go build -trimpath -ldflags "-s -w" \
+            -o dist/phylax-${{ matrix.os }}-${{ matrix.arch }}$ext ./cmd/phylax
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phylax-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Checksums
+        run: |
+          cd dist
+          find . -type f -name "phylax-*" | sort | xargs sha256sum > CHECKSUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
+          generate_release_notes: true
