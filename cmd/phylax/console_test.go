@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"phylax"
+	"github.com/codetesla51/phylax"
 )
 
 func testCDC(t *testing.T) *phylax.CDC {

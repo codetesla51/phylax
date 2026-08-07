@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"phylax"
+	"github.com/codetesla51/phylax"
 )
 
 // TestWebhookConcurrencyCapped fires a burst of changes at a slow webhook

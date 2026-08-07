@@ -24,7 +24,7 @@ import (
 	"syscall"
 	"time"
 
-	"phylax"
+	"github.com/codetesla51/phylax"
 )
 
 // options holds every CLI flag.

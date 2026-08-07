@@ -1,4 +1,4 @@
-module phylax
+module github.com/codetesla51/phylax
 
 go 1.25.6
 
