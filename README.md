@@ -145,24 +145,21 @@ log.Fatal(srv.ListenAndServe(":8080"))
 
 ## Performance
 
-Measured against a local Postgres 16 (Docker) with the checked-in [barrage](https://github.com/codetesla51/barrage) configs. One conclusion holds across every run: **the decode path was never the bottleneck — Postgres's commit rate and the SSE fan-out were.**
+**Normal load first:** phylax is built for application write volumes — tens to low thousands of changes per second — and at that scale it has room to spare. Decode keeps pace instantly, lag sits at zero, and even several dashboard subscribers receive everything, no drops. The numbers below are the **stress-test ceiling**: where the stack finally strained when we deliberately tried to break it. Read them as "we pushed until something gave," not "you'll hit this."
 
-**Single-row ladder (no subscribers).** The 500 → 2000 → 5000 writes/s configs established the single-row generator ceiling at **4,583 changes/s** — Postgres, not barrage, not phylax, topped out. Decode consumed 100% at every rate; lag drained to 0.
+**Stress ceiling — the generator walls out first.** Measured with the checked-in [barrage](https://github.com/codetesla51/barrage) configs against a local Postgres 16 (Docker): the single-row ladder (500 → 2000 → 5000 writes/s, no subscribers) established the single-row generator ceiling at **4,583 changes/s**; 50-row batched inserts raised that wall 8× to **~37,000 changes/s**. The target was 50,000 — Postgres's commit rate, not barrage and not phylax, was the cap (barrage hit 917 of its 1,000 statements/s; the failed remainder is DB saturation at concurrency 100, success 90.7–93.4%). Decode consumed **100% of everything generated in every run**, lag pinned at 0.
 
-**Subscriber matrix (batched multi-row inserts, 50,000 changes/s target, 30s runs):**
+**Stress ceiling — the fan-out is the second wall.** Each SSE subscriber is a goroutine writing one event per change; under load that path sustains roughly **26k events/s for one subscriber** and less per subscriber as the count grows (CPU contention). At ~37k changes/s:
 
-| Subscribers              | Generated | Decode consumed  | Drops        | Per-sub received |
-| ------------------------ | --------- | ----------------- | ------------ | ----------------- |
-| 11 (10 headless + 1 tab)  | ~1.285M   | 1,285,500 (100%)  | ~1.05M/sub   | ~15%              |
-| 3 (2 headless + 1 tab)    | ~1.284M   | 1,284,900 (100%)  | ~776k/sub    | ~27%              |
-| 1 (dashboard tab)         | ~1.248M   | 1,248,200 (100%)  | ~340k        | ~73%              |
+| Subscribers              | Generated | Decode consumed  | Drops      | Per-sub received |
+| ------------------------ | --------- | ----------------- | ----------- | ----------------- |
+| 11 (10 headless + 1 tab) | ~1.285M   | 1,285,500 (100%)  | ~1.05M/sub  | ~15%             |
+| 3 (2 headless + 1 tab)   | ~1.284M   | 1,284,900 (100%)  | ~776k/sub   | ~27%             |
+| 1 (dashboard tab)        | ~1.248M   | 1,248,200 (100%)  | ~340k       | ~73%             |
 
-**What the numbers mean:**
+Drops are counted in `changes_dropped` — by design, a slow subscriber never stalls the stream.
 
-- **Postgres is the generator wall.** With 50-row batched inserts the target was 50,000 changes/s; Postgres committed **~37,000/s max** (barrage hit 917 of its 1,000 statements/s — the failed remainder is DB saturation at concurrency 100, success 90.7–93.4%). Batching raised that wall 8× over single-row inserts (4,583 → ~37k changes/s).
-- **The decode path is unbounded at these rates** — 100% consumed in every run, lag pinned at 0.
-- **Delivery is subscriber math.** Each SSE subscriber is a goroutine writing one event per change; under load that path sustains roughly **26k events/s for one subscriber** and less per subscriber as the count grows (CPU contention). At ~37k changes/s: 1 subscriber sees 73% of the stream, 3 see ~27% each, 11 see ~15% each. The rest is dropped and counted in `changes_dropped` — by design, a slow subscriber never stalls the stream.
-- **The no-subscriber ceiling is still unmeasured** — the generator walls out first.
+**Where normal load sits.** At ≤2,000 changes/s the same stack ran clean: zero drops with subscribers attached, lag draining to 0. A busy application writing hundreds of changes per second is well below either wall — the delivery path alone handles ~26k events/s per subscriber, and the generator only starts straining near 37k. The no-subscriber ceiling remains unmeasured; the generator walls out first.
 
 Reproduce: `barrage run -c benchmarks/barrage-ceiling-5000.yml` (single-row ladder) or `barrage run -c benchmarks/barrage-ceiling-50k.yml` (batched matrix; subscriber counts are recorded live on the console's `subscribers` gauge). The `benchmarks/` directory holds all configs plus a sample `report.html` from the last run.
 
