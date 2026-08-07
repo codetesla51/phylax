@@ -28,7 +28,8 @@ Built on [`jackc/pglogrepl`](https://github.com/jackc/pglogrepl) and
 
 | File               | Responsibility                                                        |
 | ------------------ | --------------------------------------------------------------------- |
-| `config.go`        | `Config` struct and `DefaultConfig()` — all tunables in one place     |
+| `config.go`        | `ClientConfig` struct and `DefaultClientConfig()` — tunables in one place |
+| `cdc.go`           | Public `CDC` wrapper: `Config`, `New`, `OnChange`, `Start`              |
 | `connect.go`       | Connection helpers (`OpenReplicationConnection`, `OpenAdminConnection`) |
 | `replication.go`   | One-time setup: identify the server (`IdentifySystem`)                |
 | `slot.go`          | Replication slot existence checks and creation                        |
@@ -43,7 +44,8 @@ Built on [`jackc/pglogrepl`](https://github.com/jackc/pglogrepl) and
 - A role with `REPLICATION` privileges for the replication connection.
 - The default config connects to `postgres://us:1@localhost:5432/phy` — change
   it in `config.go` if your setup differs.
-- The tables listed in `Config.Tables` must exist (the publication is created
+- The tables listed in `Config.Tables` (CDC) / `ClientConfig.Tables` (cmd) must
+  exist (the publication is created
   `FOR TABLE users, orders`).
 
 ## Running it

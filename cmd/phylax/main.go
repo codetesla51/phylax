@@ -17,6 +17,7 @@ import (
 	"context"
 	"flag"
 	"log/slog"
+	"net/http"
 	"os"
 
 	"phylax"
@@ -36,14 +37,14 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 
 	ctx := context.Background()
-	if err := run(ctx, phylax.DefaultConfig(), logger); err != nil {
+	if err := run(ctx, phylax.DefaultClientConfig(), logger); err != nil {
 		logger.Error("replication client failed", "error", err)
 		os.Exit(1)
 	}
 }
 
 // run wires everything together and drives the stream until it ends.
-func run(ctx context.Context, cfg phylax.Config, logger *slog.Logger) error {
+func run(ctx context.Context, cfg phylax.ClientConfig, logger *slog.Logger) error {
 	// 1. Open both connections: the replication connection for streaming,
 	// the admin connection for slot and publication management.
 	replConn, err := phylax.OpenReplicationConnection(ctx, cfg.DatabaseURL)
@@ -128,6 +129,21 @@ func run(ctx context.Context, cfg phylax.Config, logger *slog.Logger) error {
 		"publication", cfg.PublicationName,
 		"start_lsn", resumeLSN.String(),
 	)
+
+	// 6. Serve decoded changes over SSE so external clients can watch the
+	// stream live. The SSE server shares the stream's broadcaster, so every
+	// change the loop decodes is also fanned out to SSE clients.
+	httpServer := &http.Server{
+		Addr:    ":8080",
+		Handler: http.HandlerFunc(phylax.NewServer(stream.Broadcaster()).NewSSEHandler),
+	}
+	go func() {
+		logger.Info("SSE server listening", "addr", httpServer.Addr)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("SSE server failed", "error", err)
+		}
+	}()
+	defer httpServer.Close()
 
 	return stream.Run(ctx)
 }

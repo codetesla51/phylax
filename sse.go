@@ -9,9 +9,16 @@ type Server struct {
 	broadcaster *Broadcaster
 }
 
-func NewServer() *Server {
+// NewServer returns a Server that fans decoded changes out through the
+// given broadcaster — typically the replication stream's broadcaster, so
+// SSE clients see every change the stream decodes. A nil broadcaster is
+// replaced with a fresh one.
+func NewServer(broadcaster *Broadcaster) *Server {
+	if broadcaster == nil {
+		broadcaster = NewBroadcaster()
+	}
 	return &Server{
-		broadcaster: NewBroadcaster(),
+		broadcaster: broadcaster,
 	}
 }
 func (s *Server) NewSSEHandler(w http.ResponseWriter, r *http.Request) {
@@ -19,7 +26,7 @@ func (s *Server) NewSSEHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	fush, ok := w.(http.Flusher)
+	flush, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
 		return
@@ -42,7 +49,7 @@ func (s *Server) NewSSEHandler(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				return
 			}
-			fush.Flush()
+			flush.Flush()
 		case <-r.Context().Done():
 			return
 		}

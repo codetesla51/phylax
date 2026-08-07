@@ -57,7 +57,7 @@ type ReplicationStream struct {
 // returns a stream ready to consume. The start LSN comes from
 // IDENTIFY_SYSTEM; the server resumes from there. The publication name is
 // passed to the pgoutput plugin so it knows which tables to send.
-func NewReplicationStream(ctx context.Context, conn *pgconn.PgConn, cfg Config, startLSN pglogrepl.LSN, logger *slog.Logger, handle ChangeHandler) (*ReplicationStream, error) {
+func NewReplicationStream(ctx context.Context, conn *pgconn.PgConn, cfg ClientConfig, startLSN pglogrepl.LSN, logger *slog.Logger, handle ChangeHandler) (*ReplicationStream, error) {
 	err := pglogrepl.StartReplication(ctx, conn, cfg.SlotName, startLSN,
 		pglogrepl.StartReplicationOptions{
 			PluginArgs: []string{

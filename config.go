@@ -8,8 +8,10 @@ package phylax
 
 import "time"
 
-// Config bundles every runtime setting the client needs.
-type Config struct {
+// ClientConfig bundles every runtime setting the client needs. It is the
+// per-connection configuration used internally by the replication stream;
+// the public CDC wrapper (see cdc.go) exposes a simpler Config on top.
+type ClientConfig struct {
 	// DatabaseURL is a libpq connection string for the *replication*
 	// connection. Logical replication requires the special parameter
 	// `replication=database`; pgx only allows it on a single dedicated
@@ -39,9 +41,9 @@ type Config struct {
 	HeartbeatInterval time.Duration
 }
 
-// DefaultConfig returns the configuration used for local development.
-func DefaultConfig() Config {
-	return Config{
+// DefaultClientConfig returns the configuration used for local development.
+func DefaultClientConfig() ClientConfig {
+	return ClientConfig{
 		DatabaseURL:       "postgres://us:1@localhost:5432/phy?replication=database",
 		AdminURL:          "postgres://us:1@localhost:5432/phy",
 		SlotName:          "my_slot",
