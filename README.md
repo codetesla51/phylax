@@ -2,7 +2,8 @@
 
 A minimal PostgreSQL **logical replication** client written in Go. It connects
 to a database, creates its own replication slot and publication, streams row
-changes (`insert` / `update` / `delete`) in real time, and logs them.
+changes (`insert` / `update` / `delete`) in real time, and hands them to your
+code — or to an HTTP webhook, a terminal, or the embedded live console.
 
 Built on [`jackc/pglogrepl`](https://github.com/jackc/pglogrepl) and
 [`jackc/pgx`](https://github.com/jackc/pgx).
@@ -10,89 +11,127 @@ Built on [`jackc/pglogrepl`](https://github.com/jackc/pglogrepl) and
 ## How it works
 
 1. **Connect** — two connections are opened:
-   - a *replication* connection (URL must include `replication=database`) that
-     speaks the logical replication protocol, and
-   - an *admin* connection used for ordinary SQL.
-2. **Identify** — `IDENTIFY_SYSTEM` returns the server's system ID, timeline,
-   and current WAL position, which becomes the starting point for streaming.
-3. **Ensure slot & publication** — the replication slot (`pgoutput` plugin) and
-   the publication (for the configured tables) are created if they don't exist
-   yet. Both steps are idempotent, so restarts are safe.
+   - a *replication* connection (the DSN is used with `replication=database`
+     appended) that speaks the logical replication protocol, and
+   - an *admin* connection for ordinary SQL.
+2. **Resume from the slot** — `IDENTIFY_SYSTEM` provides the server's system
+   ID, timeline, and current WAL position; if the replication slot already has
+   a confirmed flush position, streaming resumes there instead, so a restart
+   continues exactly where it left off (nothing lost, nothing replayed).
+3. **Ensure slot & publication** — the replication slot (`pgoutput` plugin)
+   and the publication (for the configured tables) are created if they don't
+   exist yet. Both steps are idempotent, so restarts are safe.
 4. **Stream** — `START_REPLICATION` is issued and the client loops over
    messages: it answers server keepalives, decodes `XLogData` records into
    `Change` values, hands them to the change handler, and periodically sends
    standby status updates so the server can advance the slot and discard old
    WAL.
 
-## Project layout
+## The change payload
 
-| File               | Responsibility                                                        |
-| ------------------ | --------------------------------------------------------------------- |
-| `config.go`        | `ClientConfig` struct and `DefaultClientConfig()` — tunables in one place |
-| `cdc.go`           | Public `CDC` wrapper: `Config`, `New`, `OnChange`, `Start`              |
-| `connect.go`       | Connection helpers (`OpenReplicationConnection`, `OpenAdminConnection`) |
-| `replication.go`   | One-time setup: identify the server (`IdentifySystem`)                |
-| `slot.go`          | Replication slot existence checks and creation                        |
-| `publication.go`   | Publication existence checks and creation                             |
-| `decode.go`        | WAL bytes → `Change`: `Decode` and `tupleToMap`                       |
-| `stream.go`        | Long-running loop: `ReplicationStream` (keepalives, status updates)   |
-| `broadcast.go`     | Fan-out `Broadcaster` (subscribe/unsubscribe, drop-on-full)            |
-| `metrics.go`       | Live counters (`Metrics`) and `MetricsSnapshot`                       |
-| `sse.go`           | SSE `Server`: `/events` + `/metrics/stream`, `ListenAndServe`          |
-| `dashboard.go`     | Embedded Phylax Console: serves `dashboard.html` at `/dashboard`       |
-| `dashboard.html`   | The console page (CSS + JS inline, `go:embed`-ed into the binary)      |
-| `cmd/phylax/main.go` | Thin entry point: `main()` + `run()` orchestration and the change handler |
+Every change is a `Change` value (serialised to JSON for stdout/webhooks/SSE):
 
-## Prerequisites
+```json
+{"Table":"users","Operation":"insert","OldRow":null,
+ "NewRow":{"id":"124","email":"alice@example.com","name":"Alice"}}
+```
 
-- PostgreSQL with `wal_level = logical` (a Docker container or local install).
-- A role with `REPLICATION` privileges for the replication connection.
-- The default config connects to `postgres://us:1@localhost:5432/phy` — change
-  it in `config.go` if your setup differs.
-- The tables listed in `Config.Tables` (CDC) / `ClientConfig.Tables` (cmd) must
-  exist (the publication is created
-  `FOR TABLE users, orders`).
+- `Table` — the table the change happened on.
+- `Operation` — `insert`, `update`, or `delete`.
+- `NewRow` — the row as it is now; `null` for deletes.
+- `OldRow` — the row as it was before; `null` for inserts.
 
-## Running it
+### Why `OldRow` often looks empty — replica identity
+
+PostgreSQL only sends *old* row data as allowed by the table's **replica
+identity** (`SELECT relreplident FROM pg_class WHERE relname = 'users';` —
+`d` = default, `f` = full). With the default (`d`, primary-key only):
+
+- `insert` → `OldRow` is `null` (no previous version exists).
+- `update` of a non-key column → `OldRow` is `null` (the server does not
+  bother sending an old tuple when the key did not change).
+- `update` of the primary key → `OldRow` arrives with **only the key column
+  filled**; every other column is a `null` placeholder.
+- `delete` → `OldRow` likewise carries only the key column plus `null`
+  placeholders; `NewRow` is `null` (the row is gone).
+
+This is expected, not a bug: the key is enough to identify the affected row,
+and `NewRow` always carries the full current state. If your consumer genuinely
+needs the old *values* (before/after diffs, audit trails, tables without a
+primary key), switch the table to full identity — at the cost of more WAL per
+change:
+
+```sql
+ALTER TABLE users REPLICA IDENTITY FULL;
+```
+
+## CLI
 
 ```console
 $ go run ./cmd/phylax --dsn 'postgres://us:1@localhost:5432/phy' --tables users,orders
-{"Table":"users","Operation":"insert","OldRow":null,"NewRow":{"id":"1","name":"Alice"}}
-...
+{"Table":"users","Operation":"insert","OldRow":null,"NewRow":{"id":"124","name":"Alice"}}
 ```
 
-Each change is printed to stdout as JSON. Add `-v` to see debug-level
-protocol traffic (server keepalives, raw WAL records):
+| Flag               | Default      | Meaning                                               |
+| ------------------ | ------------ | ----------------------------------------------------- |
+| `--dsn`            | required     | libpq connection string                               |
+| `--tables`         | required     | comma-separated tables to replicate                   |
+| `--webhook`        | —            | POST each change to this URL (see below)              |
+| `--slot`           | `my_slot`    | replication slot name                                 |
+| `--publication`    | `my_publication` | publication name                                  |
+| `--addr`           | `:8080`      | HTTP listen address for the console (dashboard + SSE) |
+| `--no-http`        | `false`      | disable the HTTP console server                       |
+| `-v`               | `false`      | debug-level logging (protocol traffic, raw WAL)       |
 
-```console
-$ go run ./cmd/phylax --dsn 'postgres://us:1@localhost:5432/phy' --tables users,orders -v
+Each change is printed to stdout as JSON; `-v` additionally logs server
+keepalives and raw WAL records. SIGINT/SIGTERM shuts down gracefully — the
+slot position is saved, so a restart resumes where it left off.
+
+### Webhook delivery
+
+With `--webhook`, each change is POSTed as JSON with up to 3 retries
+(1s/2s/3s backoff); after 3 failures the change is logged and dropped (the
+CLI stays up and keeps consuming — the webhook must not stall replication).
+
+### Phylax Console
+
+By default the CLI serves the **Phylax Console** on
+[http://localhost:8080/dashboard](http://localhost:8080/dashboard):
+
+- live KPI cards (`changes_processed`, `changes_dropped`, `subscribers`,
+  `replication_lag_bytes`)
+- a 60-second **log-scale lag sparkline** with a labelled y-axis
+- the **change feed** with op badges (`+ insert`, `~ update`, `× delete`),
+  pause/resume, and CSV export
+- dark/light mode (persisted), responsive from desktop to phones
+
+Change the port with `--addr`, disable HTTP with `--no-http`. If the port is
+taken the CLI logs a warning and keeps replicating — the console is a
+convenience, replication is the job.
+
+## Library
+
+```go
+cfg := phylax.Config{
+    DSN:    "postgres://us:1@localhost:5432/phy",
+    Tables: []string{"users", "orders"},
+}
+cdc, err := phylax.New(cfg)
+if err != nil { log.Fatal(err) }
+
+cdc.OnChange(func(c *phylax.Change) {
+    fmt.Printf("%s %s → %v\n", c.Operation, c.Table, c.NewRow)
+})
+
+log.Fatal(cdc.Start(context.Background()))
 ```
 
-To deliver changes to an HTTP endpoint instead of stdout, pass `--webhook`:
+`Config` fields: `DSN`, `Tables`, `SlotName` (default `my_slot`),
+`PublicationName` (default `my_publication`). Low-level tunables (keepalive
+intervals, buffer sizes, replication stream settings) live in
+`ClientConfig` / `DefaultClientConfig()`.
 
-```console
-$ go run ./cmd/phylax --dsn 'postgres://us:1@localhost:5432/phy' --tables users,orders \
-    --webhook https://example.com/changes
-```
-
-The webhook receives each change as a JSON POST with up to 3 retries (1s/2s/3s
-backoff); after 3 failures the change is logged and dropped. `--slot` and
-`--publication` override the phylax defaults. SIGINT/SIGTERM shuts down
-gracefully (slot position saved, so a restart resumes where it left off).
-
-The CLI also serves the **Phylax Console** on
-[http://localhost:8080/dashboard](http://localhost:8080/dashboard) by
-default — live KPIs, a 60-second lag sparkline, and the change feed with CSV
-export, plus the `/events` and `/metrics/stream` SSE endpoints. Change the
-port with `--addr`; disable HTTP entirely with `--no-http`. If the port is
-taken the CLI logs a warning and keeps replicating.
-
-If the replication connection drops, phylax reconnects with exponential
-backoff (1s doubling up to 30s) and resumes from the slot's saved position.
-Permanent failures — unknown tables, bad credentials — exit immediately
-instead of retrying.
-
-## Serving the console & SSE
+### Serving the console & SSE
 
 The library bundles a complete HTTP server: `phylax.NewServer(broadcaster,
 metrics)` — or `cdc.Server()` for a CDC client — serves three routes from
@@ -100,19 +139,72 @@ one `http.Server`:
 
 - `/events` — every change as an SSE event, one `data: ...` frame per change
 - `/metrics/stream` — a JSON metrics snapshot every second
-  (`changes_processed`, `changes_dropped`, `subscribers`, `replication_lag_bytes`),
-  assembled from in-memory counters only — it never subscribes to the change
-  broadcaster and never touches Postgres
+  (`changes_processed`, `changes_dropped`, `subscribers`,
+  `replication_lag_bytes`), assembled from in-memory counters only — it never
+  subscribes to the change broadcaster and never touches Postgres
 - `/dashboard` — the **Phylax Console**: a single self-contained HTML page
-  (dark/light, live KPIs, a 60-second lag sparkline, and a change feed with
-  CSV export) that reads the two SSE endpoints. It is embedded in the binary
-  (`go:embed`), so no static files need shipping
+  (embedded with `go:embed`, so no static files need shipping) that reads the
+  two SSE endpoints
 
 ```go
 srv := cdc.Server()
 log.Fatal(srv.ListenAndServe(":8080"))
 ```
 
-Open `http://localhost:8080/dashboard` in a browser for the live console.
-`Shutdown(ctx)` stops it gracefully; `Handler()` mounts the routes on an
-existing mux instead.
+`Shutdown(ctx)` stops it gracefully — including when called before `Serve`,
+in which case a later `Serve` refuses its listener instead of leaking one.
+`Handler()` mounts the routes on an existing mux instead.
+
+## Reliability
+
+- **Reconnect with backoff** — if the replication connection drops, phylax
+  reconnects with exponential backoff (1s doubling up to 30s) and resumes
+  from the slot's confirmed position.
+- **Error classification** — permanent failures (unknown tables, bad
+  credentials, missing publication) exit immediately instead of retrying.
+- **Bounded delivery** — the broadcaster drops the newest change when a
+  subscriber's buffer is full rather than blocking replication.
+- **Heartbeat & standby status** — keepalives are answered and the slot
+  advances even when the database is idle.
+
+## Metrics
+
+| Metric                 | Meaning                                                          |
+| ---------------------- | --------------------------------------------------------------- |
+| `changes_processed`    | changes decoded and dispatched since the current stream started |
+| `changes_dropped`      | changes dropped because a subscriber's buffer was full          |
+| `subscribers`          | active `OnChange`/SSE consumers                                 |
+| `replication_lag_bytes`| server WAL end − position received, in bytes (clamped at 0)     |
+
+Small non-zero lag is normal measurement granularity; watch for values that
+stay up or climb across the sparkline window — that means the consumer is
+falling behind.
+
+## Project layout
+
+| File                 | Responsibility                                                     |
+| -------------------- | ------------------------------------------------------------------ |
+| `config.go`          | `ClientConfig` and `DefaultClientConfig()` — stream tunables        |
+| `cdc.go`             | Public `CDC` wrapper: `Config`, `New`, `OnChange`, `Start`, `Server`|
+| `connect.go`         | Connection helpers (`OpenReplicationConnection`, `OpenAdminConnection`) |
+| `replication.go`     | One-time setup: `IdentifySystem`                                  |
+| `slot.go`            | Slot existence checks, creation, confirmed-flush LSN lookup        |
+| `publication.go`     | Publication existence checks and creation                         |
+| `decode.go`          | WAL bytes → `Change`: `Decode` and `tupleToMap`                   |
+| `stream.go`          | Long-running loop: `ReplicationStream` (keepalives, status, lag)  |
+| `broadcast.go`       | Fan-out `Broadcaster` (subscribe/unsubscribe, drop-on-full)        |
+| `metrics.go`         | Live counters (`Metrics`) and `MetricsSnapshot`                   |
+| `sse.go`             | SSE `Server`: `/events` + `/metrics/stream`, `Handler`/`Serve`/`Shutdown` |
+| `dashboard.go`       | Embedded console: serves `dashboard.html` at `/dashboard`          |
+| `dashboard.html`     | The console page (CSS + JS inline, `go:embed`-ed into the binary)  |
+| `cmd/phylax/main.go` | CLI entry point: flags, webhook client, console server            |
+| `cmd/sse-client/`    | Standalone SSE test client for `/events`                          |
+
+## Prerequisites
+
+- PostgreSQL with `wal_level = logical` (e.g. `docker run -e POSTGRES_PASSWORD=1 -p 5432:5432 postgres:16 -c wal_level=logical`).
+- A role with `REPLICATION` privileges for the replication connection.
+- The tables in `Config.Tables` must exist (the publication is created
+  `FOR TABLE users, orders`).
+- A role that can create logical replication slots (superuser, or a role
+  with the `REPLICATION` attribute).
