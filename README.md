@@ -8,11 +8,22 @@
 [![Go version](https://img.shields.io/github/go-mod/go-version/codetesla51/phylax?logo=go&logoColor=white&label=Go)](https://go.dev/dl/)
 [![License](https://img.shields.io/github/license/codetesla51/phylax?logo=opensourceinitiative&logoColor=white)](LICENSE)
 
-[Why phylax](#why-phylax) • [Quick start](#quick-start) • [Features](#features) • [How it works](#how-it-works) • [CLI](#cli) • [Library](#library) • [Console](#console) • [Change payload](#understanding-the-change-payload) • [Performance](#performance) • [Limitations](#deliberate-limitations) • [Project layout](#project-layout)
+[Live demo](#live-demo) • [Why phylax](#why-phylax) • [Quick start](#quick-start) • [Features](#features) • [How it works](#how-it-works) • [CLI](#cli) • [Library](#library) • [Console](#console) • [Change payload](#understanding-the-change-payload) • [Performance](#performance) • [Limitations](#deliberate-limitations) • [Project layout](#project-layout)
 
 </div>
 
 phylax connects to PostgreSQL, creates its own replication slot and publication, and streams every row change (`insert` / `update` / `delete`) to your code as it happens — to stdout, a webhook, or the embedded live console. It reconnects with backoff and resumes from the slot's saved position, so a restart loses nothing.
+
+## Live demo
+
+Try it: **[phylax · names — a live Postgres-backed demo](https://bachelor-skating-vice-mitsubishi.trycloudflare.com)**. Every name and like you see on that page arrived through phylax's logical-replication stream — the browser never talks to the database directly.
+
+![phylax console dashboard](docs/dashboard.png)
+
+The screenshot above is the embedded console the CLI serves at `/dashboard` (live KPIs, lag sparkline, change feed, dark/light).
+
+> [!NOTE]
+> The demo link is a short-lived Cloudflare quick tunnel minted for a one-off post — it may rotate and is not a permanent URL. The demo app itself is small and self-contained: a Postgres source of truth, an app-owned write connection, and phylax keeping an in-memory list in sync. The [library](#library) section below shows the same `OnChange` wiring in five lines.
 
 ## Why phylax?
 
