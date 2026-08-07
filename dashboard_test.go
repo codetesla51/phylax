@@ -30,6 +30,9 @@ func TestDashboardServed(t *testing.T) {
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
 		t.Errorf("Content-Type = %q, want text/html", ct)
 	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store (stale dashboard confuses users)", cc)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

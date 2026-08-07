@@ -18,12 +18,16 @@ import (
 //go:embed dashboard.html
 var dashboardHTML embed.FS
 
-// serveDashboard serves the embedded console at exactly /dashboard.
+// serveDashboard serves the embedded console at exactly /dashboard. The
+// page is never cached (no-store): it changes with every release, and stale
+// HTML in the browser reads old SSE URLs and stale JS, which reads as
+// "the console is broken".
 func serveDashboard(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/dashboard" {
 		http.NotFound(w, r)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	body, err := dashboardHTML.ReadFile("dashboard.html")
 	if err != nil {
 		http.Error(w, "dashboard not found", http.StatusNotFound)
