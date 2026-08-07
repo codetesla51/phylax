@@ -34,9 +34,14 @@ Not the right fit for exactly-once delivery, multi-slot HA, or frequent schema e
 docker run -d --name pg -e POSTGRES_PASSWORD=secret -p 5432:5432 postgres:16 -c wal_level=logical
 ```
 
+Install the CLI, then start it:
+
 ```bash
-go run ./cmd/phylax --dsn 'postgres://postgres:secret@localhost:5432/mydb' --tables users,orders
+go install github.com/codetesla51/phylax/cmd/phylax@latest
+phylax --dsn 'postgres://postgres:secret@localhost:5432/mydb' --tables users,orders
 ```
+
+Prefer running from source? `go run ./cmd/phylax --dsn …` behaves identically.
 
 That's it — the CLI creates its own slot and publication, starts replicating, and serves the console:
 
@@ -92,6 +97,10 @@ Every change prints as one JSON object per line:
 `--webhook` POSTs each change as JSON, retrying up to 3 times (1s/2s/3s backoff) before giving up — a slow webhook must never stall replication.
 
 ## Library
+
+```bash
+go get github.com/codetesla51/phylax
+```
 
 ```go
 cdc, err := phylax.New(phylax.Config{
