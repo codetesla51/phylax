@@ -136,13 +136,20 @@ log.Fatal(srv.ListenAndServe(":8080"))
 
 Measured with a write-heavy [barrage](https://github.com/codetesla51/barrage) ladder (500 → 2000 → 5000 writes/s, 30s runs) against a local Postgres 16:
 
-| Rate (target) | Changes streamed | Result                          |
-| ------------- | ---------------- | ------------------------------- |
-| 500/s         | ~12.4k           | clean                           |
-| 2000/s        | ~49.5k           | clean                           |
-| 5000/s        | ~123.8k          | first drops (SSE fan-out)       |
+| Rate (target) | Changes generated | Consumed | Drops |
+| ------------- | ----------------- | -------- | ----- |
+| 500/s         | ~12.4k            | all      | 0     |
+| 2000/s        | ~49.5k            | all      | 0     |
+| 5000/s        | ~123.8k (actual 4,583/s — the generator topped out) | all | ~2.5% cumulative, delivery-side |
 
-The decode/stream path kept pace at every tested rate (up to ~4,583 changes/s — lag stayed flat and drained to 0 when writes stopped). The first bottleneck was the SSE fan-out to dashboard subscribers (~2.5% drops at peak, counted in `changes_dropped`). Reproduce with the checked-in configs: `barrage run -c barrage-ceiling-500.yml`.
+Read carefully, because the numbers cut both ways:
+
+- **The generator, not phylax, was the constraint at 5,000/s.** Postgres in this test delivered 4,583/s and no more, so phylax's *consume* ceiling was never reached — 4,583 changes/s is a tested floor, not a ceiling.
+- **The decode/stream path kept pace at every rate**: everything generated was consumed, lag stayed flat, and drained to 0 when writes stopped.
+- **The observed drops were subscriber delivery, not consumption** — per-subscriber buffers filling during the console's SSE fan-out to browser tabs (drops can only happen there by construction; their distribution across runs is unknown).
+- **The no-subscriber ceiling is higher and unmeasured**: with plain `OnChange` or a webhook, the per-event socket writes disappear and the bottleneck moves to decode + JSON.
+
+Reproduce with the checked-in configs: `barrage run -c barrage-ceiling-500.yml`.
 
 > [!TIP]
 > On the lag sparkline: a **plateau** during steady writes is normal pipeline depth; a **climb** while writes continue means the consumer is falling behind; a quick **drain to 0** after writes stop is proof of health.
@@ -155,6 +162,7 @@ Each trade-off is a choice, not an oversight — what you give up, why, and when
 | ---------- | ------------------- | ------------------ |
 | **Best-effort delivery** — webhook gets 3 tries, then the change is dropped; no durable outbox | Bounded memory; the slot is the safety net (at-least-once across restarts) | Need durable/exactly-once → add an outbox or queue between phylax and the consumer |
 | **Drop-on-full subscribers** — a slow consumer's 100-entry buffer fills and changes are dropped (counted) | A subscriber must never stall the stream | Consumers can't keep pace → process faster or watch `changes_dropped` |
+| **Throughput is delivery-bound, not decode-bound** — the consume path kept pace with everything generated in testing (see [Performance](#performance)); the observed ceiling was subscriber delivery, and the no-subscriber ceiling is unmeasured | Simplicity over peak performance; drops are the designed degradation path | Sustained high write rates → benchmark your shape, then batch SSE writes, go binary, or fan out consumers |
 | **Text-format tuples, values are strings** — no binary protocol, no typed decode | pgoutput text mode is the simplest correct path | Need typed values at the source → decode binary or convert downstream |
 | **Key-only old rows** (`REPLICA IDENTITY DEFAULT`) | Leaner WAL; identity + new state covers most consumers | Need before-images → `REPLICA IDENTITY FULL` |
 | **No auth on the console** | Localhost/dev convenience, not a product | Public exposure → auth proxy or `--no-http` |
