@@ -4,9 +4,9 @@
 
 **Minimal PostgreSQL logical replication in Go — stream row changes to stdout, webhooks, or a live console.**
 
-[![CI](https://img.shields.io/github/actions/workflow/status/codetesla51/phylax/ci.yml?style=flat-square&label=ci)](https://github.com/codetesla51/phylax/actions)
-![Go](https://img.shields.io/badge/Go-1.25-00ADD8?style=flat-square&logo=go&logoColor=white)
-[![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
+[![CI](https://img.shields.io/github/actions/workflow/status/codetesla51/phylax/ci.yml?logo=githubactions&logoColor=white&label=CI)](https://github.com/codetesla51/phylax/actions)
+[![Go version](https://img.shields.io/github/go-mod/go-version/codetesla51/phylax?logo=go&logoColor=white&label=Go)](https://go.dev/dl/)
+[![License](https://img.shields.io/github/license/codetesla51/phylax?logo=opensourceinitiative&logoColor=white)](LICENSE)
 
 [Quick start](#quick-start) • [Why phylax?](#why-phylax) • [Features](#features) • [How it works](#how-it-works) • [CLI](#cli) • [Library](#library) • [Console](#console) • [Change payload](#understanding-the-change-payload) • [Performance](#performance) • [Limitations](#deliberate-limitations)
 
