@@ -46,6 +46,11 @@ type ReplicationStream struct {
 	// latest keepalive or XLogData message. Together with lastLSN it feeds
 	// ReplicationLag.
 	serverWALEnd atomic.Uint64
+	// lastDataAt is the time the most recent XLogData (actual change data)
+	// arrived. ReplicationLag reports 0 once the stream has been idle for
+	// longer than idleLagReset, so an idle slot reads as caught up instead
+	// of stuck on an unconsumed WAL tail (commit records, checkpoints).
+	lastDataAt atomic.Int64
 	// metrics counts every successfully decoded change for the live
 	// metrics stream.
 	metrics *Metrics
@@ -87,6 +92,7 @@ func NewReplicationStream(ctx context.Context, conn *pgconn.PgConn, cfg ClientCo
 		broadcaster: NewBroadcaster(),
 	}
 	s.lastLSN.Store(uint64(startLSN))
+	s.lastDataAt.Store(time.Now().UnixNano())
 	return s, nil
 }
 
@@ -102,8 +108,24 @@ func (s *ReplicationStream) Broadcaster() *Broadcaster {
 // already tracks: the server's end of WAL (latest keepalive or XLogData)
 // minus the position the client has received and confirmed. It does no
 // I/O. Returns 0 when the client is up to date or ahead of the last known
-// server position.
+// server position, or when the stream is idle (no change data received
+// for idleLagReset) — an idle slot has nothing pending, so its leftover
+// WAL tail must not read as lag.
+// idleLagReset is how long a stream can go without receiving change data
+// before lag reports 0. The server sends keepalives far more often than
+// this, and any real backlog would arrive as XLogData, so data silence
+// means caught up — the remaining WAL tail (commit records, background
+// checkpoints) is never going to be consumed and must not read as lag.
+const idleLagReset = 15 * time.Second
+
 func (s *ReplicationStream) ReplicationLag() uint64 {
+	// An idle stream has nothing pending: the gap between the last
+	// received record and the server's WAL end is only commit records
+	// and background WAL that will never be consumed. Reporting it as
+	// lag makes a healthy idle slot read as falling behind.
+	if time.Since(time.Unix(0, s.lastDataAt.Load())) > idleLagReset {
+		return 0
+	}
 	serverEnd := s.serverWALEnd.Load()
 	received := s.lastLSN.Load()
 	if serverEnd <= received {
@@ -236,6 +258,7 @@ func (s *ReplicationStream) handleCopyData(ctx context.Context, data *pgproto3.C
 		// Advance the local position: a record counts as consumed as soon
 		// as it has been received in full.
 		s.lastLSN.Store(uint64(xld.WALStart + pglogrepl.LSN(len(xld.WALData))))
+		s.lastDataAt.Store(time.Now().UnixNano())
 
 		change, err := Decode(xld.WALData, s.relations, s.metrics)
 		if err != nil {

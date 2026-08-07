@@ -147,6 +147,9 @@ func TestBroadcasterCountsDrops(t *testing.T) {
 // the received position, clamped at 0, and needs no goroutine or I/O.
 func TestReplicationLagComputedOnDemand(t *testing.T) {
 	s := &ReplicationStream{}
+	// The stream is active: fresh change data, so idle detection must not
+	// zero the reading (a zero lastDataAt would look like 1970).
+	s.lastDataAt.Store(time.Now().UnixNano())
 	s.lastLSN.Store(100)
 	s.serverWALEnd.Store(100)
 	if got := s.ReplicationLag(); got != 0 {
@@ -163,6 +166,21 @@ func TestReplicationLagComputedOnDemand(t *testing.T) {
 	s.lastLSN.Store(600)
 	if got := s.ReplicationLag(); got != 0 {
 		t.Errorf("lag when caught up = %d, want 0", got)
+	}
+
+	// An idle stream (no change data for idleLagReset) must read as 0:
+	// the WAL tail left behind is commit records and background writes
+	// that will never be consumed, not a backlog.
+	s.lastDataAt.Store(time.Now().Add(-(idleLagReset + time.Second)).UnixNano())
+	s.serverWALEnd.Store(700)
+	if got := s.ReplicationLag(); got != 0 {
+		t.Errorf("lag on an idle stream = %d, want 0", got)
+	}
+
+	// Fresh change data wakes the reading: a real gap shows again.
+	s.lastDataAt.Store(time.Now().UnixNano())
+	if got := s.ReplicationLag(); got != 100 {
+		t.Errorf("lag after new data = %d, want 100", got)
 	}
 }
 
