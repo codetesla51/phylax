@@ -16,18 +16,21 @@ type subscription struct {
 
 type Broadcaster struct {
 	mu          sync.Mutex
-	subscribers map[string]*subscription
+	subscribers map[string]*subscription // nil until first Subscribe
 }
 
 func NewBroadcaster() *Broadcaster {
-	return &Broadcaster{
-		subscribers: map[string]*subscription{},
-	}
+	return &Broadcaster{}
 }
 
 func (b *Broadcaster) Subscribe(id string, bufferSize int) chan *Change {
 	ch := make(chan *Change, bufferSize)
 	b.mu.Lock()
+	// Lazy init so a zero-value Broadcaster is usable: writing to a nil
+	// map would panic.
+	if b.subscribers == nil {
+		b.subscribers = map[string]*subscription{}
+	}
 	b.subscribers[id] = &subscription{ch: ch}
 	b.mu.Unlock()
 	return ch

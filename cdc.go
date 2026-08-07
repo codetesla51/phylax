@@ -228,6 +228,20 @@ func (c *CDC) MetricsSnapshot() MetricsSnapshot {
 	return snap
 }
 
+// Broadcaster returns the client's change broadcaster, shared by every
+// OnChange registration. Use it to plug the client into a phylax.Server so
+// SSE clients receive the same changes as OnChange subscribers.
+func (c *CDC) Broadcaster() *Broadcaster {
+	return c.broadcaster
+}
+
+// Server returns a phylax.Server wired to this client: /events fans out
+// the client's changes, /metrics/stream reports the live metrics, and
+// /dashboard serves the embedded Phylax Console.
+func (c *CDC) Server() *Server {
+	return NewServer(c.broadcaster, c)
+}
+
 // publishChange is the stream's change handler: it fans each change out to
 // the CDC broadcaster.
 func (c *CDC) publishChange(change *Change) error {

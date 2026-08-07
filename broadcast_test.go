@@ -131,6 +131,25 @@ func TestPublishDropsWhenBufferFull(t *testing.T) {
 	}
 }
 
+// TestBroadcasterZeroValueSafe verifies a zero-value Broadcaster can be
+// subscribed to and used without panicking.
+func TestBroadcasterZeroValueSafe(t *testing.T) {
+	var b Broadcaster // zero value on purpose
+
+	ch := b.Subscribe("z", 1)
+	if got := b.SubscriberCount(); got != 1 {
+		t.Fatalf("subscriber count = %d, want 1", got)
+	}
+	b.Publish(fakeChange())
+	if got := receiveOrTimeout(t, "z", ch); got == nil {
+		t.Error("zero-value broadcaster did not deliver the published change")
+	}
+	b.Unsubscribe("z")
+	if got := b.SubscriberCount(); got != 0 {
+		t.Errorf("subscriber count after unsubscribe = %d, want 0", got)
+	}
+}
+
 // TestConcurrentFanOut hammers Subscribe/Publish/Unsubscribe from a
 // goroutine while the main goroutine publishes, so the mutex-protected map
 // is exercised concurrently (run with -race).

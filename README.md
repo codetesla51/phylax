@@ -36,6 +36,11 @@ Built on [`jackc/pglogrepl`](https://github.com/jackc/pglogrepl) and
 | `publication.go`   | Publication existence checks and creation                             |
 | `decode.go`        | WAL bytes → `Change`: `Decode` and `tupleToMap`                       |
 | `stream.go`        | Long-running loop: `ReplicationStream` (keepalives, status updates)   |
+| `broadcast.go`     | Fan-out `Broadcaster` (subscribe/unsubscribe, drop-on-full)            |
+| `metrics.go`       | Live counters (`Metrics`) and `MetricsSnapshot`                       |
+| `sse.go`           | SSE `Server`: `/events` + `/metrics/stream`, `ListenAndServe`          |
+| `dashboard.go`     | Embedded Phylax Console: serves `dashboard.html` at `/dashboard`       |
+| `dashboard.html`   | The console page (CSS + JS inline, `go:embed`-ed into the binary)      |
 | `cmd/phylax/main.go` | Thin entry point: `main()` + `run()` orchestration and the change handler |
 
 ## Prerequisites
@@ -79,3 +84,28 @@ If the replication connection drops, phylax reconnects with exponential
 backoff (1s doubling up to 30s) and resumes from the slot's saved position.
 Permanent failures — unknown tables, bad credentials — exit immediately
 instead of retrying.
+
+## Serving the console & SSE
+
+The library bundles a complete HTTP server: `phylax.NewServer(broadcaster,
+metrics)` — or `cdc.Server()` for a CDC client — serves three routes from
+one `http.Server`:
+
+- `/events` — every change as an SSE event, one `data: ...` frame per change
+- `/metrics/stream` — a JSON metrics snapshot every second
+  (`changes_processed`, `changes_dropped`, `subscribers`, `replication_lag_bytes`),
+  assembled from in-memory counters only — it never subscribes to the change
+  broadcaster and never touches Postgres
+- `/dashboard` — the **Phylax Console**: a single self-contained HTML page
+  (dark/light, live KPIs, a 60-second lag sparkline, and a change feed with
+  CSV export) that reads the two SSE endpoints. It is embedded in the binary
+  (`go:embed`), so no static files need shipping
+
+```go
+srv := cdc.Server()
+log.Fatal(srv.ListenAndServe(":8080"))
+```
+
+Open `http://localhost:8080/dashboard` in a browser for the live console.
+`Shutdown(ctx)` stops it gracefully; `Handler()` mounts the routes on an
+existing mux instead.
