@@ -167,6 +167,27 @@ in which case a later `Serve` refuses its listener instead of leaking one.
 - **Heartbeat & standby status** — keepalives are answered and the slot
   advances even when the database is idle.
 
+## Limitations — deliberate decisions
+
+phylax is intentionally small: one process, one slot, one stream, best-effort
+delivery. Every trade-off below is a choice, not an oversight — what you give
+up, why, and when you'd outgrow it.
+
+| Limitation | Why it's deliberate | When to outgrow it |
+| ---------- | ------------------- | ------------------ |
+| **Best-effort delivery past retries** — the webhook gets 3 tries (1s/2s/3s backoff), then the change is dropped; there is no durable outbox | Bounded memory and simple failure handling. The slot is the only safety net: a restart resumes from the confirmed flush LSN (at-least-once across restarts) | You need durable/exactly-once delivery → insert an outbox or queue (Kafka, a Postgres table) between phylax and the consumer |
+| **Drop-on-full subscribers** — a slow consumer's 100-entry buffer fills and the change is dropped (`changes_dropped` counts them); replication never blocks | A subscriber must never stall the stream | Consumers routinely can't keep pace → process faster, add consumers, or watch `changes_dropped` |
+| **Text-format tuples, values are strings** — no binary protocol, no typed decoding (ids, timestamps stay strings) | pgoutput text mode is the simplest correct path | You need typed values at the source → decode the binary format or convert in the consumer |
+| **Key-only old rows** (`REPLICA IDENTITY DEFAULT`) — `OldRow` carries just the PK plus null placeholders | Leaner WAL; most consumers need identity + new state, not old values | You need before-images → `REPLICA IDENTITY FULL` (see "The change payload") |
+| **No auth on the console** — `/dashboard`, `/events`, `/metrics/stream` are unauthenticated | It's a localhost/dev convenience, not a product | Public exposure → reverse-proxy with auth, or `--no-http` |
+| **Single slot, single stream, single process** — no sharding, no multi-slot fan-out, no HA; a second instance on the same slot fails fast | The simplest correct model for a minimal client | Scale-out, multi-tenant, or HA → partition by slot or add leader election |
+| **No DDL handling** — schema changes on published tables (e.g. adding a column) can desync decoding and require a re-sync | Out of scope for a minimal client | Frequent schema evolution → reach for a battle-tested CDC (Debezium et al.) |
+| **Modest, unmeasured throughput** — decode + JSON marshaling is fine for ordinary rates, but the client is not benchmarked or tuned for sustained high-volume writes | Simplicity over peak performance; the lag metric tells you when it matters | Sustained high write rates → benchmark first (it'll tell you the ceiling), then batch, go binary, or fan out consumers |
+
+Metrics are in-memory too: they reset on restart, and the dashboard's
+sparkline only shows the last 60 seconds in the browser — the console is a
+live view, not a history.
+
 ## Metrics
 
 | Metric                 | Meaning                                                          |
