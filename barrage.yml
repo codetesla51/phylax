@@ -22,7 +22,7 @@ db:
   rate: 20           # queries per second, total across the weighted list
   target:
     driver: postgres
-    conn: postgres://us:1@localhost:5432/phy?sslmode=disable
+    conn: postgres://user:pass@localhost:5432/db?sslmode=disable
     queries:
       # INSERT churn on orders — no unique constraints, safe to blast.
       # Each row becomes one "+ insert" change on the console.

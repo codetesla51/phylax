@@ -20,7 +20,7 @@ db:
   rate: 2000
   target:
     driver: postgres
-    conn: postgres://us:1@localhost:5432/phy?sslmode=disable
+    conn: postgres://user:pass@localhost:5432/db?sslmode=disable
     queries:
       # pure appends — no locks, no scans
       - query: INSERT INTO orders (user_id, total, placed_at) VALUES (1, 25.00, now())

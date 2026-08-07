@@ -41,11 +41,14 @@ type ClientConfig struct {
 	HeartbeatInterval time.Duration
 }
 
-// DefaultClientConfig returns the configuration used for local development.
+// DefaultClientConfig returns an example configuration for local
+// development. The connection strings are placeholders — replace them with
+// your own DSNs; the other values are the phylax defaults (slot my_slot,
+// publication my_publication).
 func DefaultClientConfig() ClientConfig {
 	return ClientConfig{
-		DatabaseURL:       "postgres://us:1@localhost:5432/phy?replication=database",
-		AdminURL:          "postgres://us:1@localhost:5432/phy",
+		DatabaseURL:       "postgres://user:pass@localhost:5432/db?replication=database",
+		AdminURL:          "postgres://user:pass@localhost:5432/db",
 		SlotName:          "my_slot",
 		PublicationName:   "my_publication",
 		Tables:            []string{"users", "orders"},

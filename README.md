@@ -68,7 +68,7 @@ ALTER TABLE users REPLICA IDENTITY FULL;
 ## CLI
 
 ```console
-$ go run ./cmd/phylax --dsn 'postgres://us:1@localhost:5432/phy' --tables users,orders
+$ go run ./cmd/phylax --dsn 'postgres://user:pass@localhost:5432/db' --tables users,orders
 {"Table":"users","Operation":"insert","OldRow":null,"NewRow":{"id":"124","name":"Alice"}}
 ```
 
@@ -113,7 +113,7 @@ convenience, replication is the job.
 
 ```go
 cfg := phylax.Config{
-    DSN:    "postgres://us:1@localhost:5432/phy",
+    DSN:    "postgres://user:pass@localhost:5432/db", // required — no default
     Tables: []string{"users", "orders"},
 }
 cdc, err := phylax.New(cfg)
@@ -126,7 +126,8 @@ cdc.OnChange(func(c *phylax.Change) {
 log.Fatal(cdc.Start(context.Background()))
 ```
 
-`Config` fields: `DSN`, `Tables`, `SlotName` (default `my_slot`),
+`Config` fields: `DSN` (required — there is no default connection string; the
+examples use `postgres://user:pass@localhost:5432/db` as a placeholder),
 `PublicationName` (default `my_publication`). Low-level tunables (keepalive
 intervals, buffer sizes, replication stream settings) live in
 `ClientConfig` / `DefaultClientConfig()`.
