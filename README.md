@@ -8,7 +8,7 @@
 [![Go version](https://img.shields.io/github/go-mod/go-version/codetesla51/phylax?logo=go&logoColor=white&label=Go)](https://go.dev/dl/)
 [![License](https://img.shields.io/github/license/codetesla51/phylax?logo=opensourceinitiative&logoColor=white)](LICENSE)
 
-[Quick start](#quick-start) • [Why phylax?](#why-phylax) • [Features](#features) • [How it works](#how-it-works) • [CLI](#cli) • [Library](#library) • [Console](#console) • [Change payload](#understanding-the-change-payload) • [Performance](#performance) • [Limitations](#deliberate-limitations)
+[Why phylax](#why-phylax) • [Quick start](#quick-start) • [Features](#features) • [How it works](#how-it-works) • [CLI](#cli) • [Library](#library) • [Console](#console) • [Change payload](#understanding-the-change-payload) • [Performance](#performance) • [Limitations](#deliberate-limitations) • [Project layout](#project-layout)
 
 </div>
 
@@ -16,11 +16,13 @@ phylax connects to PostgreSQL, creates its own replication slot and publication,
 
 ## Why phylax?
 
-Because the replication protocol is the hard part — your business logic isn't. Logical replication is the proper way to watch a database: no trigger overhead on every write, no polling latency, only committed transactions, and the server itself tracks your position. But the sharp edges are exactly where hand-rolled clients go wrong: keepalives and `wal_sender_timeout`, standby-status timing, slot and publication lifecycle, resume semantics, and what happens when a consumer is slow. phylax does all of it and hands you a `Change` callback.
+The replication protocol is the hard part — your business logic isn't. Logical replication is the proper way to watch a database: no trigger overhead on every write, no polling latency, only committed transactions, and the server itself tracks your position. The sharp edges are exactly where hand-rolled clients go wrong: keepalives and `wal_sender_timeout`, standby-status timing, slot and publication lifecycle, resume semantics, and what happens when a consumer is slow. phylax handles all of that and hands you a `Change` callback.
 
-- **Instead of wiring pglogrepl yourself** — slot/publication provisioning, keepalive handling, reconnect with backoff, resume from the slot's LSN, and error classification are done and tested; your handler is five lines.
-- **Instead of a CDC platform** (Debezium, Kafka, …) — no JVM, no broker, no schema registry, no distributed deployment. A single small binary, or an embedded library, that delivers to your code, a webhook, or the included console.
-- **Instead of triggers or polling** — changes arrive as they commit, without touching your application code or adding write-path overhead.
+| Instead of...                          | phylax gives you...                                                                                    |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| Wiring `pglogrepl` yourself             | Slot/publication provisioning, keepalives, reconnect with backoff, LSN resume, and error classification — done and tested. Your handler is five lines. |
+| A CDC platform (Debezium, Kafka, …)     | No JVM, no broker, no schema registry, no distributed deployment. One small binary or embedded library, delivering to your code, a webhook, or the included console. |
+| Triggers or polling                     | Changes arrive as they commit — no write-path overhead, no application-code changes.                    |
 
 Not the right fit for exactly-once delivery, multi-slot HA, or frequent schema evolution — see [Deliberate limitations](#deliberate-limitations).
 
@@ -76,16 +78,16 @@ Every change prints as one JSON object per line:
 {"Table":"users","Operation":"insert","OldRow":null,"NewRow":{"email":"a@b.c","name":"Alice"}}
 ```
 
-| Flag            | Default            | Meaning                                              |
-| --------------- | ------------------ | ---------------------------------------------------- |
-| `--dsn`         | required           | libpq connection string                              |
-| `--tables`      | required           | comma-separated tables to replicate                  |
-| `--webhook`     | —                  | POST each change to this URL                         |
-| `--slot`        | `my_slot`          | replication slot name                                |
-| `--publication` | `my_publication`   | publication name                                     |
-| `--addr`        | `:8080`            | HTTP address for the console (dashboard + SSE)       |
-| `--no-http`     | `false`            | disable the HTTP console                             |
-| `-v`            | `false`            | debug-level logging (protocol traffic, raw WAL)      |
+| Flag            | Default          | Meaning                                        |
+| --------------- | ---------------- | ----------------------------------------------- |
+| `--dsn`         | required         | libpq connection string                         |
+| `--tables`      | required         | comma-separated tables to replicate             |
+| `--webhook`     | —                | POST each change to this URL                    |
+| `--slot`        | `my_slot`        | replication slot name                           |
+| `--publication` | `my_publication` | publication name                                |
+| `--addr`        | `:8080`          | HTTP address for the console (dashboard + SSE)  |
+| `--no-http`     | `false`          | disable the HTTP console                        |
+| `-v`            | `false`          | debug-level logging (protocol traffic, raw WAL) |
 
 `--webhook` POSTs each change as JSON, retrying up to 3 times (1s/2s/3s backoff) before giving up — a slow webhook must never stall replication.
 
@@ -111,13 +113,11 @@ log.Fatal(cdc.Start(context.Background()))
 
 `cdc.Server()` (or `phylax.NewServer(broadcaster, metrics)`) serves three routes from one `http.Server`:
 
-| Route            | What it serves                                                        |
-| ---------------- | --------------------------------------------------------------------- |
-| `/events`        | every change as an SSE event                                          |
-| `/metrics/stream`| a JSON metrics snapshot every second (`changes_processed`, `changes_dropped`, `subscribers`, `replication_lag_bytes`) |
-| `/dashboard`     | the embedded console page (`go:embed`, no static files to ship)       |
-
-**Delivery buffers.** Every `/events` subscriber gets a bounded channel — **10 events** for SSE subscribers, **100** for the `OnChange` consumer — sized at `Broadcaster.Subscribe(id, bufferSize)` time in code (constants in `sse.go` / `cdc.go`, not exposed via config or CLI). A full buffer drops the change and counts it in `changes_dropped` rather than stalling the stream.
+| Route             | What it serves                                                                         |
+| ----------------- | --------------------------------------------------------------------------------------- |
+| `/events`         | every change as an SSE event                                                             |
+| `/metrics/stream` | a JSON metrics snapshot every second (`changes_processed`, `changes_dropped`, `subscribers`, `replication_lag_bytes`) |
+| `/dashboard`      | the embedded console page (`go:embed`, no static files to ship)                          |
 
 ```go
 srv := cdc.Server()
@@ -125,6 +125,8 @@ log.Fatal(srv.ListenAndServe(":8080"))
 ```
 
 `Shutdown(ctx)` stops it gracefully (works even if called before `Serve` — a later `Serve` refuses its listener instead of leaking one); `Handler()` mounts the routes on an existing mux.
+
+**Delivery buffers.** Every `/events` subscriber gets a bounded channel — **10 events** for SSE subscribers, **100** for the `OnChange` consumer — sized at `Broadcaster.Subscribe(id, bufferSize)` time in code (constants in `sse.go` / `cdc.go`, not exposed via config or CLI). A full buffer drops the change and counts it in `changes_dropped` rather than stalling the stream.
 
 > [!WARNING]
 > The console endpoints are unauthenticated by design — localhost/dev only. Put them behind an auth proxy if exposed publicly, or use `--no-http`.
@@ -143,19 +145,19 @@ log.Fatal(srv.ListenAndServe(":8080"))
 
 ## Performance
 
-Measured against a local Postgres 16 (Docker) with the checked-in [barrage](https://github.com/codetesla51/barrage) configs. One conclusion across every run: **the decode path was never the bottleneck — Postgres's commit rate and the SSE fan-out were.**
+Measured against a local Postgres 16 (Docker) with the checked-in [barrage](https://github.com/codetesla51/barrage) configs. One conclusion holds across every run: **the decode path was never the bottleneck — Postgres's commit rate and the SSE fan-out were.**
 
-**Single-row ladder (no subscribers):** the 500 → 2000 → 5000 writes/s configs established the single-row generator ceiling at **4,583 changes/s** — Postgres, not barrage, not phylax, topped out. Decode consumed 100% at every rate; lag drained to 0.
+**Single-row ladder (no subscribers).** The 500 → 2000 → 5000 writes/s configs established the single-row generator ceiling at **4,583 changes/s** — Postgres, not barrage, not phylax, topped out. Decode consumed 100% at every rate; lag drained to 0.
 
 **Subscriber matrix (batched multi-row inserts, 50,000 changes/s target, 30s runs):**
 
-| Subscribers | Generated | Decode consumed | Drops | Per-sub received |
-| ----------- | --------- | --------------- | ----- | ---------------- |
-| 11 (10 headless + 1 tab) | ~1.285M | 1,285,500 (100%) | ~1.05M/sub | ~15% |
-| 3 (2 headless + 1 tab)   | ~1.284M | 1,284,900 (100%) | ~776k/sub | ~27% |
-| 1 (dashboard tab)        | ~1.248M | 1,248,200 (100%) | ~340k | ~73% |
+| Subscribers              | Generated | Decode consumed  | Drops        | Per-sub received |
+| ------------------------ | --------- | ----------------- | ------------ | ----------------- |
+| 11 (10 headless + 1 tab)  | ~1.285M   | 1,285,500 (100%)  | ~1.05M/sub   | ~15%              |
+| 3 (2 headless + 1 tab)    | ~1.284M   | 1,284,900 (100%)  | ~776k/sub    | ~27%              |
+| 1 (dashboard tab)         | ~1.248M   | 1,248,200 (100%)  | ~340k        | ~73%              |
 
-What the numbers mean:
+**What the numbers mean:**
 
 - **Postgres is the generator wall.** With 50-row batched inserts the target was 50,000 changes/s; Postgres committed **~37,000/s max** (barrage hit 917 of its 1,000 statements/s — the failed remainder is DB saturation at concurrency 100, success 90.7–93.4%). Batching raised that wall 8× over single-row inserts (4,583 → ~37k changes/s).
 - **The decode path is unbounded at these rates** — 100% consumed in every run, lag pinned at 0.
@@ -171,28 +173,28 @@ Reproduce: `barrage run -c benchmarks/barrage-ceiling-5000.yml` (single-row ladd
 
 Each trade-off is a choice, not an oversight — what you give up, why, and when you'd outgrow it.
 
-| Limitation | Why it's deliberate | When to outgrow it |
-| ---------- | ------------------- | ------------------ |
-| **Best-effort delivery** — 3 webhook retries, then drop; no durable outbox | Keeps memory bounded; the slot is the safety net (at-least-once) | Need exactly-once → add an outbox between phylax and the consumer |
-| **Drop-on-full subscribers** — SSE subscribers hold a **10-event buffer** (100 for the `OnChange` consumer); sizes are set in code at `Subscribe(id, size)` time, not via config; a full buffer drops the change (counted) | A subscriber must never stall the stream | Consumers can't keep pace → speed them up or watch `changes_dropped` |
-| **Ghost subscribers** — an SSE client that drops its connection without a clean close stays registered until the next write fails, so `subscribers` can lag reality while idle | Unsubscribe-on-write-error is simple and correct-enough | Need exact live counts → heartbeat or read-side EOF detection |
-| **Delivery-bound, not decode-bound** — decode consumed 100% at every tested rate (up to ~37k changes/s); the walls are Postgres's commit rate and SSE fan-out ([Performance](#performance)) | Drops are the designed degradation path | Sustained high write rates → batch SSE writes, go binary, or fan out consumers |
-| **Text tuples, string values** — no binary protocol, no typed decode | Text mode is the simplest correct path | Need typed values → decode binary or convert downstream |
-| **Key-only old rows** (`REPLICA IDENTITY DEFAULT`) | Leaner WAL; identity + new state covers most consumers | Need before-images → `REPLICA IDENTITY FULL` |
-| **No auth on the console** | Localhost/dev convenience, not a product | Public exposure → auth proxy or `--no-http` |
-| **Single slot / stream / process** — no sharding, no HA | Simplest correct model for a minimal client | Scale-out → partition by slot or add leader election |
-| **No DDL handling** — schema changes can desync decoding | Out of scope for a minimal client | Frequent schema evolution → use a battle-tested CDC (Debezium) |
+| Limitation                                                                                                                                                                    | Why it's deliberate                                                              | When to outgrow it                                                     |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| **Best-effort delivery** — 3 webhook retries, then drop; no durable outbox                                                                                                     | Keeps memory bounded; the slot is the safety net (at-least-once)                   | Need exactly-once → add an outbox between phylax and the consumer        |
+| **Drop-on-full subscribers** — SSE subscribers hold a 10-event buffer (100 for the `OnChange` consumer); sizes are set in code at `Subscribe(id, size)` time, not via config; a full buffer drops the change (counted) | A subscriber must never stall the stream                                          | Consumers can't keep pace → speed them up or watch `changes_dropped`     |
+| **Ghost subscribers** — an SSE client that drops its connection without a clean close stays registered until the next write fails, so `subscribers` can lag reality while idle | Unsubscribe-on-write-error is simple and correct-enough                           | Need exact live counts → heartbeat or read-side EOF detection            |
+| **Delivery-bound, not decode-bound** — decode consumed 100% at every tested rate (up to ~37k changes/s); the walls are Postgres's commit rate and SSE fan-out ([Performance](#performance)) | Drops are the designed degradation path                                          | Sustained high write rates → batch SSE writes, go binary, or fan out consumers |
+| **Text tuples, string values** — no binary protocol, no typed decode                                                                                                           | Text mode is the simplest correct path                                            | Need typed values → decode binary or convert downstream                  |
+| **Key-only old rows** (`REPLICA IDENTITY DEFAULT`)                                                                                                                             | Leaner WAL; identity + new state covers most consumers                            | Need before-images → `REPLICA IDENTITY FULL`                             |
+| **No auth on the console**                                                                                                                                                     | Localhost/dev convenience, not a product                                          | Public exposure → auth proxy or `--no-http`                              |
+| **Single slot / stream / process** — no sharding, no HA                                                                                                                        | Simplest correct model for a minimal client                                       | Scale-out → partition by slot or add leader election                     |
+| **No DDL handling** — schema changes can desync decoding                                                                                                                       | Out of scope for a minimal client                                                 | Frequent schema evolution → use a battle-tested CDC (Debezium)           |
 
 ## Project layout
 
-| File                 | Responsibility                                                       |
-| -------------------- | -------------------------------------------------------------------- |
-| `cdc.go`             | Public `CDC` wrapper: `Config`, `New`, `OnChange`, `Start`, `Server` |
-| `decode.go`          | WAL bytes → `Change`: `Decode` and `tupleToMap`                      |
-| `stream.go`          | Long-running loop: keepalives, standby status, lag                   |
-| `broadcast.go`       | Fan-out `Broadcaster` (subscribe/unsubscribe, drop-on-full)           |
-| `sse.go`             | SSE `Server`: `/events` + `/metrics/stream`, `Handler`/`Shutdown`    |
-| `dashboard.go`/`html`| Embedded console served at `/dashboard`                              |
-| `metrics.go`         | Live counters (`Metrics`) and `MetricsSnapshot`                      |
-| `cmd/phylax/main.go` | CLI entry point: flags, webhook client, console server               |
-| `benchmarks/`       | Barrage load-test configs (single-row ladder + 50k batched matrix) and a sample `report.html` from the last run |
+| File                  | Responsibility                                                     |
+| --------------------- | -------------------------------------------------------------------- |
+| `cdc.go`               | Public `CDC` wrapper: `Config`, `New`, `OnChange`, `Start`, `Server` |
+| `decode.go`            | WAL bytes → `Change`: `Decode` and `tupleToMap`                     |
+| `stream.go`            | Long-running loop: keepalives, standby status, lag                  |
+| `broadcast.go`         | Fan-out `Broadcaster` (subscribe/unsubscribe, drop-on-full)          |
+| `sse.go`               | SSE `Server`: `/events` + `/metrics/stream`, `Handler`/`Shutdown`    |
+| `dashboard.go`/`html`  | Embedded console served at `/dashboard`                             |
+| `metrics.go`           | Live counters (`Metrics`) and `MetricsSnapshot`                     |
+| `cmd/phylax/main.go`   | CLI entry point: flags, webhook client, console server              |
+| `benchmarks/`          | Barrage load-test configs (single-row ladder + 50k batched matrix) and a sample `report.html` from the last run |
