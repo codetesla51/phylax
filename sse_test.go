@@ -189,6 +189,35 @@ func TestServerShutdownWithoutServe(t *testing.T) {
 	}
 }
 
+// TestServerShutdownBeforeServeRefusesServe verifies Shutdown called before
+// Serve still marks the server shut down, so the later Serve refuses its
+// listener (and closes it) instead of serving forever without ever being
+// stoppable.
+func TestServerShutdownBeforeServeRefusesServe(t *testing.T) {
+	srv := NewServer(nil, nil)
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown before Serve: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- srv.Serve(ln) }()
+
+	select {
+	case err := <-serveDone:
+		if !errors.Is(err, http.ErrServerClosed) {
+			t.Fatalf("Serve after Shutdown = %v, want ErrServerClosed", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve after Shutdown is still serving — listener leaked")
+	}
+}
+
 // TestCDCServerWiring verifies cdc.Server() wires the metrics endpoint to
 // the CDC client: the OnChange subscriber shows up in the snapshot.
 func TestCDCServerWiring(t *testing.T) {

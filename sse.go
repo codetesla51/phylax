@@ -108,13 +108,20 @@ func (s *Server) ListenAndServe(addr string) error {
 // Shutdown gracefully stops the HTTP server started by Serve or
 // ListenAndServe: it waits for in-flight requests to finish or ctx to
 // expire. It is a no-op when the server is not running.
+//
+// Shutdown also works when it is called before Serve has started: it still
+// marks the server shut down, so a Serve that starts afterwards refuses its
+// listener and returns http.ErrServerClosed instead of serving forever
+// without ever being stoppable.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
+	if s.srv == nil {
+		// Create the http.Server eagerly: its Shutdown sets the in-shutdown
+		// flag, which a later Serve checks before accepting its listener.
+		s.srv = &http.Server{Handler: s.Handler()}
+	}
 	srv := s.srv
 	s.mu.Unlock()
-	if srv == nil {
-		return nil
-	}
 	return srv.Shutdown(ctx)
 }
 

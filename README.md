@@ -80,6 +80,13 @@ backoff); after 3 failures the change is logged and dropped. `--slot` and
 `--publication` override the phylax defaults. SIGINT/SIGTERM shuts down
 gracefully (slot position saved, so a restart resumes where it left off).
 
+The CLI also serves the **Phylax Console** on
+[http://localhost:8080/dashboard](http://localhost:8080/dashboard) by
+default — live KPIs, a 60-second lag sparkline, and the change feed with CSV
+export, plus the `/events` and `/metrics/stream` SSE endpoints. Change the
+port with `--addr`; disable HTTP entirely with `--no-http`. If the port is
+taken the CLI logs a warning and keeps replicating.
+
 If the replication connection drops, phylax reconnects with exponential
 backoff (1s doubling up to 30s) and resumes from the slot's saved position.
 Permanent failures — unknown tables, bad credentials — exit immediately

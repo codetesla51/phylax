@@ -2,8 +2,9 @@
 // only the standard library.
 //
 // It parses flags into a phylax.Config, registers a change consumer (webhook
-// POST with retry, or stdout printing), and runs the CDC client until
-// SIGINT/SIGTERM triggers a graceful shutdown.
+// POST with retry, or stdout printing), serves the Phylax Console over HTTP
+// (dashboard + SSE endpoints, disabled with --no-http), and runs the CDC
+// client until SIGINT/SIGTERM triggers a graceful shutdown.
 
 package main
 
@@ -11,9 +12,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -31,6 +34,8 @@ type options struct {
 	webhook     string
 	slot        string
 	publication string
+	addr        string
+	noHTTP      bool
 	verbose     bool
 }
 
@@ -52,6 +57,8 @@ func parseFlags() *options {
 	flag.StringVar(&opts.webhook, "webhook", "", "URL to POST each change to (optional)")
 	flag.StringVar(&opts.slot, "slot", "", "replication slot name (default: phylax.Config default)")
 	flag.StringVar(&opts.publication, "publication", "", "publication name (default: phylax.Config default)")
+	flag.StringVar(&opts.addr, "addr", ":8080", "HTTP listen address for the console (dashboard + SSE)")
+	flag.BoolVar(&opts.noHTTP, "no-http", false, "disable the HTTP console server")
 	flag.BoolVar(&opts.verbose, "v", false, "enable debug-level logging")
 
 	flag.Parse()
@@ -93,7 +100,58 @@ func run(opts *options) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Serve the console over HTTP unless disabled. The console is a
+	// convenience: if the port is taken we log a warning and keep
+	// replicating. Shutdown runs after Start returns.
+	var console *phylax.Server
+	if !opts.noHTTP {
+		var err error
+		console, err = newConsoleServer(cdc, opts.addr)
+		if err != nil {
+			slog.Warn("phylax: console not started", "addr", opts.addr, "error", err)
+		} else {
+			slog.Info("phylax: console", "url", dashboardURL(opts.addr))
+		}
+	}
+	defer func() {
+		if console == nil {
+			return
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := console.Shutdown(shutdownCtx); err != nil {
+			slog.Warn("phylax: console shutdown", "error", err)
+		}
+	}()
+
 	return cdc.Start(ctx)
+}
+
+// newConsoleServer starts the HTTP console (dashboard + SSE endpoints) for
+// cdc on addr, serving in the background until Shutdown is called. Bind
+// errors are returned synchronously, so the caller can log and keep running
+// replication even when the console port is taken.
+func newConsoleServer(cdc *phylax.CDC, addr string) (*phylax.Server, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("listen %s: %w", addr, err)
+	}
+	srv := cdc.Server()
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Warn("phylax: console server stopped", "error", err)
+		}
+	}()
+	return srv, nil
+}
+
+// dashboardURL turns a listen address into the dashboard's public URL for
+// the startup log line.
+func dashboardURL(addr string) string {
+	if strings.HasPrefix(addr, ":") {
+		addr = "localhost" + addr
+	}
+	return "http://" + addr + "/dashboard"
 }
 
 // splitTables parses a comma-separated flag value into a table list,
