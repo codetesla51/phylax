@@ -74,3 +74,8 @@ The webhook receives each change as a JSON POST with up to 3 retries (1s/2s/3s
 backoff); after 3 failures the change is logged and dropped. `--slot` and
 `--publication` override the phylax defaults. SIGINT/SIGTERM shuts down
 gracefully (slot position saved, so a restart resumes where it left off).
+
+If the replication connection drops, phylax reconnects with exponential
+backoff (1s doubling up to 30s) and resumes from the slot's saved position.
+Permanent failures — unknown tables, bad credentials — exit immediately
+instead of retrying.

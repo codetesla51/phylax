@@ -1,4 +1,5 @@
-// main.go — phylax CLI: a thin wrapper around the phylax.CDC API.
+// main.go — phylax CLI: a thin wrapper around the phylax.CDC API, using
+// only the standard library.
 //
 // It parses flags into a phylax.Config, registers a change consumer (webhook
 // POST with retry, or stdout printing), and runs the CDC client until
@@ -10,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -19,16 +21,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spf13/cobra"
-
 	"phylax"
 )
-
-func main() {
-	if err := newRootCmd().Execute(); err != nil {
-		os.Exit(1)
-	}
-}
 
 // options holds every CLI flag.
 type options struct {
@@ -40,31 +34,33 @@ type options struct {
 	verbose     bool
 }
 
-func newRootCmd() *cobra.Command {
+func main() {
+	opts := parseFlags()
+	if err := run(opts); err != nil {
+		fmt.Fprintln(os.Stderr, "phylax:", err)
+		os.Exit(1)
+	}
+}
+
+// parseFlags reads the command line into options and enforces the required
+// flags. Missing required flags print usage and exit with status 2.
+func parseFlags() *options {
 	opts := &options{}
 
-	cmd := &cobra.Command{
-		Use:   "phylax",
-		Short: "Replicate PostgreSQL changes to a webhook or stdout",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return run(opts)
-		},
-		// Print errors without dumping usage on runtime failures; flag
-		// validation errors still show usage.
-		SilenceUsage: true,
+	flag.StringVar(&opts.dsn, "dsn", "", "libpq connection string (required)")
+	flag.StringVar(&opts.tables, "tables", "", "comma-separated tables to replicate (required)")
+	flag.StringVar(&opts.webhook, "webhook", "", "URL to POST each change to (optional)")
+	flag.StringVar(&opts.slot, "slot", "", "replication slot name (default: phylax.Config default)")
+	flag.StringVar(&opts.publication, "publication", "", "publication name (default: phylax.Config default)")
+	flag.BoolVar(&opts.verbose, "v", false, "enable debug-level logging")
+
+	flag.Parse()
+
+	if opts.dsn == "" || opts.tables == "" {
+		flag.Usage()
+		os.Exit(2)
 	}
-
-	cmd.Flags().StringVar(&opts.dsn, "dsn", "", "libpq connection string (required)")
-	cmd.Flags().StringVar(&opts.tables, "tables", "", "comma-separated tables to replicate (required)")
-	cmd.Flags().StringVar(&opts.webhook, "webhook", "", "URL to POST each change to (optional)")
-	cmd.Flags().StringVar(&opts.slot, "slot", "", "replication slot name (default: phylax.Config default)")
-	cmd.Flags().StringVar(&opts.publication, "publication", "", "publication name (default: phylax.Config default)")
-	cmd.Flags().BoolVarP(&opts.verbose, "verbose", "v", false, "enable debug-level logging")
-
-	_ = cmd.MarkFlagRequired("dsn")
-	_ = cmd.MarkFlagRequired("tables")
-
-	return cmd
+	return opts
 }
 
 // run builds the CDC config from flags, registers the change consumer, and
@@ -91,14 +87,7 @@ func run(opts *options) error {
 	if opts.webhook != "" {
 		cdc.OnChange(webhookChangeHandler(opts.webhook))
 	} else {
-		cdc.OnChange(func(change *phylax.Change) {
-			line, err := json.Marshal(change)
-			if err != nil {
-				slog.Error("printing change", "error", err)
-				return
-			}
-			fmt.Println(string(line))
-		})
+		cdc.OnChange(stdoutHandler)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -120,34 +109,62 @@ func splitTables(s string) []string {
 	return tables
 }
 
-// webhookChangeHandler returns an OnChange callback that POSTs each change
-// as JSON to the webhook URL, retrying up to three times with a 1s/2s/3s
-// backoff on request errors or non-2xx responses. After three failures it
-// logs the error and drops the change.
+// stdoutHandler prints each change as a JSON line to stdout.
+func stdoutHandler(change *phylax.Change) {
+	line, err := json.Marshal(change)
+	if err != nil {
+		slog.Error("printing change", "error", err)
+		return
+	}
+	fmt.Println(string(line))
+}
+
+// webhookConcurrency caps how many webhook POSTs may be in flight at once.
+const webhookConcurrency = 5
+
+// webhookChangeHandler returns an OnChange callback that delivers each
+// change as a JSON POST to the webhook URL. Delivery runs in a goroutine
+// per change, bounded by a semaphore of webhookConcurrency: when all slots
+// are busy the callback blocks (backpressure), so a slow webhook queues
+// changes in the subscriber channel instead of spawning unbounded
+// goroutines.
 func webhookChangeHandler(url string) func(*phylax.Change) {
 	client := &http.Client{Timeout: 10 * time.Second}
+	sem := make(chan struct{}, webhookConcurrency)
 
 	return func(change *phylax.Change) {
-		body, err := json.Marshal(change)
-		if err != nil {
-			slog.Error("webhook: marshaling change", "error", err)
-			return
-		}
+		sem <- struct{}{} // acquire; blocks while webhookConcurrency POSTs are in flight
 
-		for attempt := 1; attempt <= 3; attempt++ {
-			if err := postJSON(client, url, body); err == nil {
-				return
-			} else {
-				slog.Warn("webhook: delivery attempt failed", "attempt", attempt, "error", err)
-			}
-			time.Sleep(time.Duration(attempt) * time.Second)
-		}
-
-		slog.Error("webhook: giving up on change after 3 attempts",
-			"table", change.Table,
-			"operation", change.Operation,
-		)
+		go func() {
+			defer func() { <-sem }() // release
+			postWithRetry(client, url, change)
+		}()
 	}
+}
+
+// postWithRetry delivers one change, retrying up to three times with a
+// 1s/2s/3s backoff on request errors or non-2xx responses. After three
+// failures it logs the error and drops the change.
+func postWithRetry(client *http.Client, url string, change *phylax.Change) {
+	body, err := json.Marshal(change)
+	if err != nil {
+		slog.Error("webhook: marshaling change", "error", err)
+		return
+	}
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		if err := postJSON(client, url, body); err == nil {
+			return
+		} else {
+			slog.Warn("webhook: delivery attempt failed", "attempt", attempt, "error", err)
+		}
+		time.Sleep(time.Duration(attempt) * time.Second)
+	}
+
+	slog.Error("webhook: giving up on change after 3 attempts",
+		"table", change.Table,
+		"operation", change.Operation,
+	)
 }
 
 // postJSON sends one POST and returns an error on transport failure or a

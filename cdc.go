@@ -4,9 +4,10 @@
 //
 // The CDC client owns a broadcaster: OnChange registers a subscriber that
 // receives every decoded change, and Start runs the replication loop until
-// the context is cancelled or a fatal error occurs. On shutdown Start closes
-// the connections and unsubscribes every OnChange registration so their
-// goroutines exit cleanly.
+// the context is cancelled. If the replication connection drops, Start
+// reconnects with exponential backoff and resumes from the slot's saved
+// position. On shutdown Start closes the connections and unsubscribes every
+// OnChange registration so their goroutines exit cleanly.
 //
 // Integration with other transports (SSE, webhooks, ...) is left to the
 // caller, built on top of OnChange.
@@ -21,6 +22,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Config configures a CDC client.
@@ -103,13 +106,61 @@ func (c *CDC) OnChange(fn func(*Change)) {
 }
 
 // Start connects, ensures the slot and publication exist, and runs the
-// read/decode/broadcast loop until ctx is cancelled or a fatal error occurs.
+// read/decode/broadcast loop until ctx is cancelled.
+//
+// If the replication connection drops mid-stream, Start reconnects with
+// exponential backoff (1s doubling up to 30s) and resumes from the slot's
+// confirmed position, logging each retry. It keeps retrying — even when the
+// database is unreachable at startup — until ctx is cancelled.
+//
+// Only transient failures (connection loss, server restart) are retried.
+// Permanent failures — e.g. unknown tables or bad credentials — stop Start
+// immediately and are returned as errors.
 //
 // On ctx cancellation Start shuts down gracefully: the connections are
 // closed and every OnChange registration is unsubscribed, so their
 // goroutines exit via the closed subscriber channel. A clean shutdown
 // returns nil.
 func (c *CDC) Start(ctx context.Context) error {
+	const (
+		initialBackoff = time.Second
+		maxBackoff     = 30 * time.Second
+	)
+
+	backoff := initialBackoff
+	var lastErr error
+
+	for attempt := 1; ; attempt++ {
+		lastErr = c.runOnce(ctx)
+		if lastErr == nil || ctx.Err() != nil || !retryable(lastErr) {
+			break // stream ended cleanly, shutdown requested, or permanent error
+		}
+
+		slog.Warn("phylax: replication stopped, retrying",
+			"failed_attempt", attempt,
+			"error", lastErr,
+			"retry_in", backoff,
+		)
+		if !sleepCtx(ctx, backoff) {
+			break // ctx cancelled during backoff
+		}
+		backoff = min(backoff*2, maxBackoff)
+	}
+
+	// Graceful shutdown: close every OnChange subscriber channel so the
+	// subscriber goroutines exit via `for range`.
+	c.unsubscribeAll()
+
+	if ctx.Err() != nil {
+		return nil // clean shutdown on ctx cancellation
+	}
+	return lastErr
+}
+
+// runOnce runs one full replication session: connect, slot and publication
+// setup, and the read/decode/broadcast loop. It returns when the stream
+// ends for any reason — connection drop, server error, or ctx cancellation.
+func (c *CDC) runOnce(ctx context.Context) error {
 	// 1. Connections: the replication connection for streaming, the admin
 	// connection for slot and publication management.
 	replConn, err := OpenReplicationConnection(ctx, replicationDSN(c.cfg.DSN))
@@ -125,7 +176,8 @@ func (c *CDC) Start(ctx context.Context) error {
 	defer adminConn.Close(context.Background())
 
 	// 2. Where to start from: the slot's saved position when it has one,
-	// otherwise the server's current WAL position.
+	// otherwise the server's current WAL position. On a reconnect this is
+	// the last confirmed flush LSN, so nothing is lost or replayed.
 	sysIdent, err := IdentifySystem(ctx, replConn)
 	if err != nil {
 		return err
@@ -151,16 +203,7 @@ func (c *CDC) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	err = stream.Run(ctx)
-
-	// 5. Graceful shutdown: close every OnChange subscriber channel so the
-	// subscriber goroutines exit via `for range`.
-	c.unsubscribeAll()
-
-	if ctx.Err() != nil {
-		return nil // clean shutdown on ctx cancellation
-	}
-	return err
+	return stream.Run(ctx)
 }
 
 // publishChange is the stream's change handler: it fans each change out to
@@ -206,4 +249,39 @@ func replicationDSN(dsn string) string {
 		sep = "&"
 	}
 	return dsn + sep + "replication=database"
+}
+
+// sleepCtx sleeps for d, returning false early if ctx is cancelled.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// retryable reports whether err is a transient failure worth reconnecting
+// for. Server-side SQL errors (pgconn.PgError) are permanent unless their
+// SQLSTATE marks a connection or operator-intervention condition (server
+// restarting, too many connections, ...); everything else — dial, TLS,
+// protocol, and terminated-walsender failures — is treated as transient.
+func retryable(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "08000", "08001", "08003", "08006", // connection exception
+			"53300",                            // too many connections
+			"57P01", "57P02", "57P03", "57P04": // operator intervention
+			return true
+		}
+		return false
+	}
+	return true
 }
