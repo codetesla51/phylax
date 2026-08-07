@@ -12,9 +12,11 @@
   Preview: python3 -m http.server 8000  →  http://localhost:8000/dashboard.html
   (endpoints 404 until the Go server serves them — design-review friendly)
 
-  Design: black & white, both modes; Fira Code for data, Fira Sans for
-  labels; the lag sparkline (log-scale, labelled axis) is the page's one
-  signature element.
+  Design: black & white, both modes; a single IBM Plex Mono family and a
+  live-session identity — blinking cursor, SQL-comment empty state,
+  inverted selection — so the console reads like a psql session watching
+  the replication stream. The lag sparkline (log-scale, labelled axis)
+  is the page's one data signature.
 
   Responsive: mobile-first; fluid type and spacing (clamp); container
   query for the change feed; viewport breakpoints sized to content;
@@ -28,7 +30,7 @@
 <title>phylax · replication console</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fira+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.2/src/regular/style.css">
 <script>
 // Theme init before paint: stored choice wins, else the system preference.
@@ -44,24 +46,24 @@
 :root[data-theme="dark"] {
   color-scheme: dark;
   --bg: #000000;
-  --panel: #0c0c0e;
-  --border: #232327;
-  --border-soft: #16161a;
-  --text: #f5f5f6;
-  --muted: #9a9aa2;
-  --faint: #606068;
-  --solid: #f5f5f6; /* inverted blocks (status dot, op marks) */
+  --panel: #0b0b0d;
+  --border: #1e1e23;
+  --border-soft: #141418;
+  --text: #f4f4f5;
+  --muted: #96969f;
+  --faint: #52525b;
+  --solid: #f4f4f5; /* inverted blocks (status dot, op marks) */
 }
 :root[data-theme="light"] {
   color-scheme: light;
   --bg: #ffffff;
-  --panel: #fafafb;
-  --border: #e4e4e8;
-  --border-soft: #efeff2;
-  --text: #101013;
-  --muted: #6a6a73;
-  --faint: #9c9ca4;
-  --solid: #101013;
+  --panel: #f9f9fa;
+  --border: #e2e2e6;
+  --border-soft: #ededf0;
+  --text: #0f0f11;
+  --muted: #62626b;
+  --faint: #9c9ca3;
+  --solid: #0f0f11;
 }
 
 * { box-sizing: border-box; }
@@ -71,11 +73,22 @@ html, body { margin: 0; padding: 0; }
 body {
   background: var(--bg);
   color: var(--text);
-  font: 400 clamp(15px, 1vw + 13px, 16px)/1.5 "Fira Sans", system-ui, sans-serif;
+  font: 400 clamp(13.5px, 0.6vw + 12.5px, 14.5px)/1.55 "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   -webkit-font-smoothing: antialiased;
 }
 
 :focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+
+::selection { background: var(--solid); color: var(--bg); }
+
+/* live session cursor — the page's one blinking element */
+.cursor {
+  display: inline-block; width: 7px; height: 13px;
+  background: var(--faint);
+  animation: blink 1.2s steps(2, start) infinite;
+  flex: none;
+}
+@keyframes blink { to { visibility: hidden; } }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
@@ -101,21 +114,20 @@ body {
 .identity { display: flex; align-items: baseline; gap: clamp(12px, 2vw, 18px); min-width: 0; }
 
 .wordmark {
-  font: 600 clamp(12px, 0.6vw + 11px, 14px)/1 "Fira Code", ui-monospace, monospace;
-  letter-spacing: 0.22em; text-transform: uppercase; flex: none;
+  font: 600 clamp(12px, 0.6vw + 11px, 14px)/1 "IBM Plex Mono", ui-monospace, monospace;
+  letter-spacing: 0.26em; text-transform: uppercase; flex: none;
 }
-.wordmark::after { content: "▍"; color: var(--faint); }
 
 .session {
-  font: 400 clamp(11.5px, 0.5vw + 10.5px, 13px)/1 "Fira Code", ui-monospace, monospace;
+  font: 400 clamp(11.5px, 0.5vw + 10.5px, 13px)/1 "IBM Plex Mono", ui-monospace, monospace;
   color: var(--muted);
   display: flex; align-items: center; gap: 10px; min-width: 0;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
 .dot {
-  width: 8px; height: 8px; border-radius: 50%;
-  border: 1.5px solid var(--faint); flex: none;
+  width: 7px; height: 13px; border-radius: 1px;
+  border: 1px solid var(--faint); flex: none;
 }
 .dot.live { background: var(--solid); border-color: var(--solid); }
 
@@ -127,11 +139,12 @@ body {
 
 .btn {
   display: inline-flex; align-items: center; gap: 8px;
-  font: 500 clamp(12px, 0.4vw + 11px, 13px)/1 "Fira Sans", system-ui, sans-serif;
+  font: 500 clamp(11px, 0.4vw + 10px, 12px)/1 "IBM Plex Mono", ui-monospace, monospace;
+  letter-spacing: 0.08em; text-transform: uppercase;
   color: var(--text);
   background: transparent;
   border: 1px solid var(--border);
-  border-radius: 7px;
+  border-radius: 2px;
   padding: 9px 13px;
   cursor: pointer;
   transition: background-color 160ms ease, border-color 160ms ease;
@@ -151,37 +164,37 @@ body {
 
 .kpi {
   background: var(--panel);
-  border: 1px solid var(--border-soft);
-  border-radius: 10px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
   padding: clamp(14px, 2vw, 18px) clamp(14px, 2.5vw, 20px) clamp(12px, 2vw, 16px);
   min-width: 0;
 }
 
 .kpi-label {
   margin: 0 0 clamp(8px, 1.2vw, 12px);
-  font: 500 clamp(10px, 0.3vw + 9.5px, 11px)/1.2 "Fira Sans", system-ui, sans-serif;
-  text-transform: uppercase; letter-spacing: 0.11em;
+  font: 500 clamp(9.5px, 0.3vw + 9px, 10.5px)/1.2 "IBM Plex Mono", ui-monospace, monospace;
+  text-transform: uppercase; letter-spacing: 0.14em;
   color: var(--muted);
 }
 
 .kpi-num {
   margin: 0;
-  font: 500 clamp(26px, 3.2vw + 18px, 44px)/1.05 "Fira Code", ui-monospace, monospace;
+  font: 500 clamp(25px, 3.2vw + 17px, 42px)/1.05 "IBM Plex Mono", ui-monospace, monospace;
   font-variant-numeric: tabular-nums;
-  letter-spacing: -0.03em;
+  letter-spacing: -0.02em;
   overflow-wrap: anywhere;
 }
 
 .kpi-num.tick { animation: tick 150ms ease-out; }
 @keyframes tick { 0% { opacity: 0.35; } 100% { opacity: 1; } }
 
-.kpi-sub { margin: 10px 0 0; font: 400 clamp(10px, 0.3vw + 9.5px, 11px)/1.3 "Fira Code", ui-monospace, monospace; color: var(--faint); min-height: 1.4em; }
+.kpi-sub { margin: 10px 0 0; font: 400 clamp(9.5px, 0.3vw + 9px, 10.5px)/1.3 "IBM Plex Mono", ui-monospace, monospace; color: var(--faint); min-height: 1.4em; }
 
 .kpi-sub.warn {
   display: inline-block;
   border: 1px solid var(--border);
   background: var(--solid); color: var(--bg);
-  padding: 2px 7px; border-radius: 4px;
+  padding: 2px 7px; border-radius: 2px;
   font-weight: 600;
 }
 
@@ -208,15 +221,15 @@ body {
 
 .feed-head h2 {
   margin: 0;
-  font: 600 clamp(11px, 0.4vw + 10.5px, 12px)/1 "Fira Code", ui-monospace, monospace;
-  text-transform: uppercase; letter-spacing: 0.18em;
+  font: 600 clamp(11px, 0.4vw + 10.5px, 12px)/1 "IBM Plex Mono", ui-monospace, monospace;
+  text-transform: uppercase; letter-spacing: 0.22em;
 }
 
-.feed-meta { font: 400 clamp(11px, 0.4vw + 10.5px, 12px)/1 "Fira Code", ui-monospace, monospace; color: var(--faint); white-space: nowrap; }
+.feed-meta { font: 400 clamp(11px, 0.4vw + 10.5px, 12px)/1 "IBM Plex Mono", ui-monospace, monospace; color: var(--faint); white-space: nowrap; }
 
 .feed-empty {
   padding: 28px 4px;
-  font: 400 clamp(13px, 0.5vw + 12px, 14px)/1.5 "Fira Sans", system-ui, sans-serif;
+  font: 400 clamp(12px, 0.5vw + 11px, 13px)/1.6 "IBM Plex Mono", ui-monospace, monospace;
   color: var(--muted);
 }
 
@@ -225,7 +238,7 @@ body {
   grid-template-columns: 72px auto 110px 1fr;
   gap: clamp(6px, 1vw, 10px); align-items: baseline;
   padding-block: 7px; padding-inline: 4px;
-  font: 400 clamp(11.5px, 0.5vw + 10.5px, 12.5px)/1.4 "Fira Code", ui-monospace, monospace;
+  font: 400 clamp(11.5px, 0.5vw + 10.5px, 12.5px)/1.45 "IBM Plex Mono", ui-monospace, monospace;
   border-bottom: 1px solid var(--border-soft);
 }
 .feed-row:hover { background: var(--panel); }
@@ -233,9 +246,9 @@ body {
 .feed-time { color: var(--faint); font-variant-numeric: tabular-nums; }
 
 .op {
-  font: 600 10px/1 "Fira Code", ui-monospace, monospace;
-  text-transform: uppercase; letter-spacing: 0.06em;
-  border-radius: 4px;
+  font: 600 9.5px/1 "IBM Plex Mono", ui-monospace, monospace;
+  text-transform: uppercase; letter-spacing: 0.08em;
+  border-radius: 2px;
   padding: 3px 7px;
   display: inline-flex; align-items: center; justify-content: center;
   justify-self: start; white-space: nowrap;
@@ -304,7 +317,7 @@ body {
 
   <header class="topbar">
     <div class="identity">
-      <span class="wordmark">phylax</span>
+      <span class="wordmark">phylax</span><span class="cursor" aria-hidden="true"></span>
       <span class="session" id="sessionLine">
         <span class="dot" id="statusDot" aria-hidden="true"></span>
         <span id="statusText" aria-live="polite">connecting…</span>
@@ -358,7 +371,7 @@ body {
         <h2>changes</h2>
         <span class="feed-meta" id="feedMeta">0 rows</span>
       </div>
-      <p class="feed-empty" id="feedEmpty">No changes yet — they'll appear here as they stream.</p>
+      <p class="feed-empty" id="feedEmpty">-- no changes yet; they'll appear here as they stream --</p>
       <div id="feedRows" class="feed-rows"></div>
     </section>
   </main>
@@ -544,7 +557,7 @@ function drawLag() {
   // decade gridlines, labelled when they fit
   const axisLabel = (v) =>
     v >= 1 << 20 ? (v >> 20) + "M" : v >= 1 << 10 ? (v >> 10) + "K" : String(v);
-  ctx.font = "400 9px 'Fira Code', ui-monospace, monospace";
+  ctx.font = "400 9px 'IBM Plex Mono', ui-monospace, monospace";
   ctx.textAlign = "right";
   ctx.lineWidth = 1;
   const minLabelGap = 11; // px between labels before we drop one
