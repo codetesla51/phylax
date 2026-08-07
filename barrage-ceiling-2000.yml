@@ -1,0 +1,35 @@
+# barrage-ceiling.yml — phylax sustained-throughput probe (rate ladder).
+# Write-only append load (no row locks, no scans) so Postgres can generate
+# changes as fast as it can: the ceiling we're hunting is phylax's consume
+# rate, not DB query shapes.
+#
+# How to read the result (on the console):
+#   changes_dropped stays 0 and lag PLATEAUS during load, then drains to 0
+#   after → phylax keeps pace.
+#   drops appear, or the lag line CLIMBS while load runs → you found the
+#   ceiling (or the DB saturated first — barrage's correlation will say which).
+#
+# Ladder: run barrage-ceiling-500, then -2000, then -5000.
+
+duration: 30s
+bucket_width: 2s     # coarser buckets = steadier lag reading
+ramp: 5s
+concurrency: 20
+
+db:
+  rate: 2000
+  target:
+    driver: postgres
+    conn: postgres://us:1@localhost:5432/phy?sslmode=disable
+    queries:
+      # pure appends — no locks, no scans
+      - query: INSERT INTO orders (user_id, total, placed_at) VALUES (1, 25.00, now())
+        weight: 65
+        type: write
+      - query: INSERT INTO users (email, name) VALUES ('load-' || floor(random()*1e9)::int || '-' || clock_timestamp() || '@example.com', 'load')
+        weight: 25
+        type: write
+      # a single light read, just to keep the read path honest
+      - query: SELECT count(*) FROM orders
+        weight: 10
+        type: read

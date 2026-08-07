@@ -182,7 +182,7 @@ up, why, and when you'd outgrow it.
 | **No auth on the console** — `/dashboard`, `/events`, `/metrics/stream` are unauthenticated | It's a localhost/dev convenience, not a product | Public exposure → reverse-proxy with auth, or `--no-http` |
 | **Single slot, single stream, single process** — no sharding, no multi-slot fan-out, no HA; a second instance on the same slot fails fast | The simplest correct model for a minimal client | Scale-out, multi-tenant, or HA → partition by slot or add leader election |
 | **No DDL handling** — schema changes on published tables (e.g. adding a column) can desync decoding and require a re-sync | Out of scope for a minimal client | Frequent schema evolution → reach for a battle-tested CDC (Debezium et al.) |
-| **Modest, unmeasured throughput** — decode + JSON marshaling is fine for ordinary rates, but the client is not benchmarked or tuned for sustained high-volume writes | Simplicity over peak performance; the lag metric tells you when it matters | Sustained high write rates → benchmark first (it'll tell you the ceiling), then batch, go binary, or fan out consumers |
+| **Modest throughput, subscriber-bound at the top end** — measured with a barrage ladder (500 → 5000/s, write-heavy mix): the decode/stream path keeps pace at every tested rate (up to 4,583 changes/s — lag flat, drains to 0 when writes stop). The first observed ceiling is the SSE fan-out: with 2 dashboard subscribers attached, ~4k changes/s sustained before per-subscriber buffers fill and changes are dropped (~2.5% at peak, counted in `changes_dropped`). The no-subscriber ceiling is higher and unmeasured | Simplicity over peak performance; drops are the designed degradation path | Sustained high write rates → benchmark your own shape first, then batch SSE writes, go binary, or fan out consumers |
 
 Metrics are in-memory too: they reset on restart, and the dashboard's
 sparkline only shows the last 60 seconds in the browser — the console is a
@@ -197,9 +197,11 @@ live view, not a history.
 | `subscribers`          | active `OnChange`/SSE consumers                                 |
 | `replication_lag_bytes`| server WAL end − position received, in bytes (clamped at 0)     |
 
-Small non-zero lag is normal measurement granularity; watch for values that
-stay up or climb across the sparkline window — that means the consumer is
-falling behind.
+Under a steady write rate, lag plateaus at a small positive value — that's
+the natural pipeline depth (WAL written since the last message received) and
+it is healthy; it falls back to 0 the moment writes stop. The signal to
+worry about is a *climbing* trend across the sparkline window while writes
+continue — that means the consumer is genuinely falling behind.
 
 ## Project layout
 

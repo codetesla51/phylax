@@ -1,0 +1,55 @@
+# barrage.yml — load test for the phylax stack.
+#
+# What this exercises:
+#   db    write mix             — real INSERT/UPDATE churn against phy, which
+#                                 flows through logical replication into the
+#                                 console (changes_processed climbs, feed
+#                                 scrolls). Reads are included as the
+#                                 contrast: they load the DB but generate no
+#                                 replication changes.
+#
+# The phylax CLI must be running (it owns :8080 and the replication slot).
+# Rates are modest on purpose — phylax is a small client, and the point is
+# to watch the console react, not to melt it. Crank rates if you want to
+# see replication_lag_bytes climb.
+
+duration: 30s        # how long to run
+bucket_width: 1s     # correlation/timeline bucket size
+ramp: 5s             # ramp rate from 0 to full over this window
+concurrency: 10      # in-flight requests per runner
+
+db:
+  rate: 20           # queries per second, total across the weighted list
+  target:
+    driver: postgres
+    conn: postgres://us:1@localhost:5432/phy?sslmode=disable
+    queries:
+      # INSERT churn on orders — no unique constraints, safe to blast.
+      # Each row becomes one "+ insert" change on the console.
+      - query: INSERT INTO orders (user_id, total, placed_at) VALUES (1, 25.00, now())
+        weight: 25
+        type: write
+
+      # UPDATE churn on the same row — "~ update" changes (non-key column,
+      # so OldRow stays null, as documented in the README).
+      - query: UPDATE orders SET total = total + 1.00 WHERE id = 1
+        weight: 15
+        type: write
+
+      # INSERTs on users must be unique on email, so the email is generated:
+      # random + statement timestamp makes collisions practically impossible.
+      - query: INSERT INTO users (email, name) VALUES ('load-' || floor(random()*1e9)::int || '-' || clock_timestamp() || '@example.com', 'load')
+        weight: 15
+        type: write
+
+      - query: UPDATE users SET name = 'tick ' || clock_timestamp() WHERE id = 1
+        weight: 10
+        type: write
+
+      # reads — real DB work, zero replication changes
+      - query: SELECT count(*) FROM orders
+        weight: 15
+        type: read
+      - query: SELECT id, user_id, total FROM orders ORDER BY id DESC LIMIT 10
+        weight: 20
+        type: read
