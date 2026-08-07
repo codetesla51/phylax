@@ -87,15 +87,15 @@ func TestDecodeCountsChanges(t *testing.T) {
 	}
 
 	// Insert: one change, one count.
-	change, err := Decode(insertBytes(), rels, m)
+	changes, err := Decode(insertBytes(), rels, m)
 	if err != nil {
 		t.Fatalf("Decode(insert): %v", err)
 	}
-	if change == nil {
-		t.Fatal("Decode(insert) returned nil change")
+	if len(changes) != 1 {
+		t.Fatalf("Decode(insert) returned %d changes, want 1", len(changes))
 	}
-	if change.Table != "users" || change.Operation != "insert" {
-		t.Errorf("unexpected change: %+v", change)
+	if changes[0].Table != "users" || changes[0].Operation != "insert" {
+		t.Errorf("unexpected change: %+v", changes[0])
 	}
 	if got := m.ChangesProcessed.Load(); got != 1 {
 		t.Errorf("changes processed after insert = %d, want 1", got)

@@ -260,23 +260,20 @@ func (s *ReplicationStream) handleCopyData(ctx context.Context, data *pgproto3.C
 		s.lastLSN.Store(uint64(xld.WALStart + pglogrepl.LSN(len(xld.WALData))))
 		s.lastDataAt.Store(time.Now().UnixNano())
 
-		change, err := Decode(xld.WALData, s.relations, s.metrics)
+		changes, err := Decode(xld.WALData, s.relations, s.metrics)
 		if err != nil {
 			return fmt.Errorf("decoding WAL data: %w", err)
 		}
-		if change == nil {
-			return nil // bookkeeping message, nothing for the handler
-		}
 
-		s.logger.Debug("change decoded", "table", change.Table, "operation", change.Operation)
-
-		// Fan the change out to every subscriber, then hand it to the
+		// Fan every change out to the subscribers, then hand it to the
 		// handler. Publishing first means subscribers still see the change
 		// even if the handler later fails and aborts the stream.
-		s.broadcaster.Publish(change)
-
-		if err := s.handle(change); err != nil {
-			return fmt.Errorf("change handler failed: %w", err)
+		for _, change := range changes {
+			s.logger.Debug("change decoded", "table", change.Table, "operation", change.Operation)
+			s.broadcaster.Publish(change)
+			if err := s.handle(change); err != nil {
+				return fmt.Errorf("change handler failed: %w", err)
+			}
 		}
 	}
 	return nil

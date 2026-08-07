@@ -2,8 +2,8 @@
 //
 // The pgoutput plugin sends a stream of protocol messages. Most of them are
 // low-level bookkeeping (begin/commit, keepalives, relation metadata...).
-// This file only deals with the three message kinds that represent actual
-// data changes: Insert, Update and Delete.
+// This file deals with the four message kinds that represent actual data
+// changes: Insert, Update, Delete and Truncate.
 
 package phylax
 
@@ -13,39 +13,46 @@ import (
 	"github.com/jackc/pglogrepl"
 )
 
-// Change describes one logical change on a single row.
+// Change describes one logical change on a single row — or, for a TRUNCATE,
+// on a whole table.
 type Change struct {
 	// Table is the name of the table the change happened on.
 	Table string
 
-	// Operation is one of "insert", "update" or "delete".
+	// Operation is one of "insert", "update", "delete" or "truncate".
+	// A truncate change means every row in Table was removed: it carries no
+	// row data (OldRow and NewRow are nil), and TRUNCATE a, b, c emits one
+	// truncate change per table.
 	Operation string
 
-	// OldRow holds the pre-change column values (nil for inserts).
+	// OldRow holds the pre-change column values (nil for inserts and
+	// truncates).
 	OldRow map[string]any
 
-	// NewRow holds the post-change column values (nil for deletes).
+	// NewRow holds the post-change column values (nil for deletes and
+	// truncates).
 	NewRow map[string]any
 }
 
-// Decode parses one chunk of WAL data and returns the Change it describes,
-// or nil when the message carries no row change (relation metadata,
-// transaction begin/commit, keepalives, ...).
+// Decode parses one chunk of WAL data and returns the Changes it describes.
+// It returns an empty slice when the message carries no row change
+// (relation metadata, transaction begin/commit, keepalives, ...). Most
+// messages yield at most one Change; a TRUNCATE statement can truncate
+// several tables at once, so it yields one Change per truncated table.
 //
-// Every successfully decoded, non-nil Change increments
-// metrics.ChangesProcessed, if metrics is non-nil.
+// Every successfully decoded Change increments metrics.ChangesProcessed,
+// if metrics is non-nil.
 //
 // Relation metadata is cached in `relations` and reused across calls: the
 // server sends a RelationMessage the first time a table is referenced, and
 // afterwards row data is compact — tuples reference columns by index and
 // rely on the cached relation for the column names.
-func Decode(walData []byte, relations map[uint32]*pglogrepl.RelationMessage, metrics *Metrics) (*Change, error) {
+func Decode(walData []byte, relations map[uint32]*pglogrepl.RelationMessage, metrics *Metrics) ([]*Change, error) {
 	msg, err := pglogrepl.Parse(walData)
 	if err != nil {
 		return nil, fmt.Errorf("parsing WAL data: %w", err)
 	}
 
-	var change *Change
 	switch m := msg.(type) {
 	case *pglogrepl.RelationMessage:
 		// Cache the table metadata so later row messages can be decoded.
@@ -57,44 +64,69 @@ func Decode(walData []byte, relations map[uint32]*pglogrepl.RelationMessage, met
 		if err != nil {
 			return nil, err
 		}
-		change = &Change{
+		return counted(metrics, &Change{
 			Table:     rel.RelationName,
 			Operation: "insert",
 			NewRow:    tupleToMap(m.Tuple, rel),
-		}
+		}), nil
 
 	case *pglogrepl.UpdateMessage:
 		rel, err := relationFor(relations, m.RelationID)
 		if err != nil {
 			return nil, err
 		}
-		change = &Change{
+		return counted(metrics, &Change{
 			Table:     rel.RelationName,
 			Operation: "update",
 			OldRow:    tupleToMap(m.OldTuple, rel),
 			NewRow:    tupleToMap(m.NewTuple, rel),
-		}
+		}), nil
 
 	case *pglogrepl.DeleteMessage:
 		rel, err := relationFor(relations, m.RelationID)
 		if err != nil {
 			return nil, err
 		}
-		change = &Change{
+		return counted(metrics, &Change{
 			Table:     rel.RelationName,
 			Operation: "delete",
 			OldRow:    tupleToMap(m.OldTuple, rel),
+		}), nil
+
+	case *pglogrepl.TruncateMessage:
+		// TRUNCATE empties whole tables. One statement can truncate several
+		// at once (TRUNCATE a, b, c), so emit one table-level change per
+		// relation id. Relation metadata arrives before any data message
+		// referencing a table, so the cache must already hold every id.
+		if len(m.RelationIDs) == 0 {
+			return nil, nil
 		}
+		changes := make([]*Change, 0, len(m.RelationIDs))
+		for _, relID := range m.RelationIDs {
+			rel, err := relationFor(relations, relID)
+			if err != nil {
+				return nil, err
+			}
+			changes = append(changes, &Change{Table: rel.RelationName, Operation: "truncate"})
+		}
+		if metrics != nil {
+			metrics.ChangesProcessed.Add(int64(len(changes)))
+		}
+		return changes, nil
 
 	default:
-		// Begin/Commit/Truncate/Type/Origin messages carry no row change.
+		// Begin/Commit/Type/Origin messages carry no row change.
 		return nil, nil
 	}
+}
 
+// counted returns one decoded change in a single-element slice (the common
+// case) and counts it in the processed-change metrics.
+func counted(metrics *Metrics, change *Change) []*Change {
 	if metrics != nil {
 		metrics.ChangesProcessed.Add(1)
 	}
-	return change, nil
+	return []*Change{change}
 }
 
 // relationFor looks up the cached metadata for a relation ID. Every data

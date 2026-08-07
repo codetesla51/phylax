@@ -259,6 +259,10 @@ body {
   background: var(--solid); color: var(--bg);
   text-decoration: line-through; text-decoration-thickness: 1.5px;
 }
+.op-truncate {
+  background: var(--solid); color: var(--bg);
+  border: 1px dashed var(--bg);
+}
 
 .feed-table { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -606,10 +610,11 @@ function drawLag() {
 }
 
 // ── change feed ─────────────────────────────────────────────────────
-const opGlyph = { insert: "+", update: "~", delete: "×" };
-const opClass = { insert: "op-insert", update: "op-update", delete: "op-delete" };
+const opGlyph = { insert: "+", update: "~", delete: "×", truncate: "∅" };
+const opClass = { insert: "op-insert", update: "op-update", delete: "op-delete", truncate: "op-truncate" };
 
 function rowSummary(change) {
+  if (change.Operation === "truncate") return "all rows";
   const row = change.NewRow || change.OldRow || {};
   return JSON.stringify(row);
 }

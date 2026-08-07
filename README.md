@@ -12,7 +12,7 @@
 
 </div>
 
-phylax connects to PostgreSQL, creates its own replication slot and publication, and streams every row change (`insert` / `update` / `delete`) to your code as it happens — to stdout, a webhook, or the embedded live console. It reconnects with backoff and resumes from the slot's saved position, so a restart loses nothing.
+phylax connects to PostgreSQL, creates its own replication slot and publication, and streams every row change (`insert` / `update` / `delete` / `truncate`) to your code as it happens — to stdout, a webhook, or the embedded live console. It reconnects with backoff and resumes from the slot's saved position, so a restart loses nothing.
 
 ## Live demo
 
@@ -65,7 +65,7 @@ That's it — the CLI creates its own slot and publication, starts replicating, 
 
 ## Features
 
-- **Real-time row changes** — `insert` / `update` / `delete` as they commit
+- **Real-time row changes** — `insert` / `update` / `delete` / `truncate` as they commit
 - **Self-provisioning** — creates its own slot + publication, idempotent and restart-safe
 - **Resume from LSN** — backoff reconnect (1s → 30s); picks up exactly where it left off
 - **Embedded console** — a self-contained dashboard at `/dashboard`: KPI cards, log-scale lag sparkline, live feed with CSV export, dark/light mode
@@ -159,6 +159,7 @@ log.Fatal(srv.ListenAndServe(":8080"))
 
 - `NewRow` — the row as it is now; `null` for deletes
 - `OldRow` — the row as it was before; `null` for inserts
+- `truncate` — the whole table was emptied; both rows are `null`, and a single `TRUNCATE a, b, c;` emits one event per table (this is the only operation that carries no row data)
 
 > [!NOTE]
 > Why `OldRow` is usually sparse: PostgreSQL only ships old-row data as allowed by the table's **replica identity** (default = primary key only). Non-key updates send no old tuple at all; deletes and key changes send the key plus `null` placeholders. This is expected behavior, not a bug. If your consumer needs old *values* (diffs, audit), switch the table to `ALTER TABLE users REPLICA IDENTITY FULL;` — at the cost of more WAL per change.
