@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -63,6 +64,9 @@ type CDC struct {
 	mu          sync.Mutex
 	subIDs      map[string]struct{} // every active OnChange subscriber id
 	nextSubID   int
+	// stream is the currently running replication stream, replaced on every
+	// reconnect. It feeds the live metrics snapshot.
+	stream atomic.Pointer[ReplicationStream]
 }
 
 // New validates cfg and returns a CDC client. It does not connect; the
@@ -203,7 +207,25 @@ func (c *CDC) runOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	c.stream.Store(stream)
 	return stream.Run(ctx)
+}
+
+// MetricsSnapshot returns a point-in-time reading of the live metrics:
+// changes processed by the current stream, changes dropped for the
+// broadcaster's subscribers, the active subscriber count, and the current
+// replication lag. It reads only in-memory state — no database or network
+// access. With no stream running yet, processed and lag are zero.
+func (c *CDC) MetricsSnapshot() MetricsSnapshot {
+	stream := c.stream.Load()
+	snap := MetricsSnapshot{}
+	if stream != nil {
+		snap.ChangesProcessed = stream.metrics.ChangesProcessed.Load()
+		snap.ReplicationLag = stream.ReplicationLag()
+	}
+	snap.ChangesDropped = c.broadcaster.ChangesDropped()
+	snap.Subscribers = c.broadcaster.SubscriberCount()
+	return snap
 }
 
 // publishChange is the stream's change handler: it fans each change out to

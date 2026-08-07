@@ -32,16 +32,20 @@ type Change struct {
 // or nil when the message carries no row change (relation metadata,
 // transaction begin/commit, keepalives, ...).
 //
+// Every successfully decoded, non-nil Change increments
+// metrics.ChangesProcessed, if metrics is non-nil.
+//
 // Relation metadata is cached in `relations` and reused across calls: the
 // server sends a RelationMessage the first time a table is referenced, and
 // afterwards row data is compact — tuples reference columns by index and
 // rely on the cached relation for the column names.
-func Decode(walData []byte, relations map[uint32]*pglogrepl.RelationMessage) (*Change, error) {
+func Decode(walData []byte, relations map[uint32]*pglogrepl.RelationMessage, metrics *Metrics) (*Change, error) {
 	msg, err := pglogrepl.Parse(walData)
 	if err != nil {
 		return nil, fmt.Errorf("parsing WAL data: %w", err)
 	}
 
+	var change *Change
 	switch m := msg.(type) {
 	case *pglogrepl.RelationMessage:
 		// Cache the table metadata so later row messages can be decoded.
@@ -53,39 +57,44 @@ func Decode(walData []byte, relations map[uint32]*pglogrepl.RelationMessage) (*C
 		if err != nil {
 			return nil, err
 		}
-		return &Change{
+		change = &Change{
 			Table:     rel.RelationName,
 			Operation: "insert",
 			NewRow:    tupleToMap(m.Tuple, rel),
-		}, nil
+		}
 
 	case *pglogrepl.UpdateMessage:
 		rel, err := relationFor(relations, m.RelationID)
 		if err != nil {
 			return nil, err
 		}
-		return &Change{
+		change = &Change{
 			Table:     rel.RelationName,
 			Operation: "update",
 			OldRow:    tupleToMap(m.OldTuple, rel),
 			NewRow:    tupleToMap(m.NewTuple, rel),
-		}, nil
+		}
 
 	case *pglogrepl.DeleteMessage:
 		rel, err := relationFor(relations, m.RelationID)
 		if err != nil {
 			return nil, err
 		}
-		return &Change{
+		change = &Change{
 			Table:     rel.RelationName,
 			Operation: "delete",
 			OldRow:    tupleToMap(m.OldTuple, rel),
-		}, nil
+		}
 
 	default:
 		// Begin/Commit/Truncate/Type/Origin messages carry no row change.
 		return nil, nil
 	}
+
+	if metrics != nil {
+		metrics.ChangesProcessed.Add(1)
+	}
+	return change, nil
 }
 
 // relationFor looks up the cached metadata for a relation ID. Every data

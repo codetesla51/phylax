@@ -59,9 +59,9 @@ func TestPublishUsesSubscriberMap(t *testing.T) {
 	b := NewBroadcaster()
 	fakeA := make(chan *Change, 1)
 	fakeB := make(chan *Change, 1)
-	b.subscribers = map[string]chan *Change{
-		"fake-a": fakeA,
-		"fake-b": fakeB,
+	b.subscribers = map[string]*subscription{
+		"fake-a": {ch: fakeA},
+		"fake-b": {ch: fakeB},
 	}
 
 	want := fakeChange()

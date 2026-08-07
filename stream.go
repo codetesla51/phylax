@@ -42,6 +42,13 @@ type ReplicationStream struct {
 	// written by the receive loop and read by the heartbeat goroutine,
 	// so it is an atomic to stay race-free.
 	lastLSN atomic.Uint64
+	// serverWALEnd is the server's current WAL position as reported in the
+	// latest keepalive or XLogData message. Together with lastLSN it feeds
+	// ReplicationLag.
+	serverWALEnd atomic.Uint64
+	// metrics counts every successfully decoded change for the live
+	// metrics stream.
+	metrics *Metrics
 	// heartbeat is how often standby status updates are sent.
 	heartbeat time.Duration
 	// replyNow wakes the heartbeat goroutine so it sends a status update
@@ -72,6 +79,7 @@ func NewReplicationStream(ctx context.Context, conn *pgconn.PgConn, cfg ClientCo
 	s := &ReplicationStream{
 		conn:        conn,
 		relations:   map[uint32]*pglogrepl.RelationMessage{},
+		metrics:     &Metrics{},
 		heartbeat:   cfg.HeartbeatInterval,
 		replyNow:    make(chan struct{}, 1),
 		logger:      logger,
@@ -87,6 +95,21 @@ func NewReplicationStream(ctx context.Context, conn *pgconn.PgConn, cfg ClientCo
 // streams in.
 func (s *ReplicationStream) Broadcaster() *Broadcaster {
 	return s.broadcaster
+}
+
+// ReplicationLag returns how far behind the server's current WAL position
+// the client is, in bytes, computed on demand from the LSNs the stream
+// already tracks: the server's end of WAL (latest keepalive or XLogData)
+// minus the position the client has received and confirmed. It does no
+// I/O. Returns 0 when the client is up to date or ahead of the last known
+// server position.
+func (s *ReplicationStream) ReplicationLag() uint64 {
+	serverEnd := s.serverWALEnd.Load()
+	received := s.lastLSN.Load()
+	if serverEnd <= received {
+		return 0
+	}
+	return serverEnd - received
 }
 
 // Run consumes the replication stream until the context is cancelled, the
@@ -186,6 +209,7 @@ func (s *ReplicationStream) handleCopyData(ctx context.Context, data *pgproto3.C
 		if err != nil {
 			return fmt.Errorf("parsing primary keepalive message: %w", err)
 		}
+		s.serverWALEnd.Store(uint64(pkm.ServerWALEnd))
 		s.logger.Debug("primary keepalive",
 			"server_time", pkm.ServerTime,
 			"reply_requested", pkm.ReplyRequested,
@@ -203,6 +227,7 @@ func (s *ReplicationStream) handleCopyData(ctx context.Context, data *pgproto3.C
 		if err != nil {
 			return fmt.Errorf("parsing XLogData message: %w", err)
 		}
+		s.serverWALEnd.Store(uint64(xld.ServerWALEnd))
 		s.logger.Debug("received xlog data",
 			"wal_start", xld.WALStart,
 			"bytes", len(xld.WALData),
@@ -212,7 +237,7 @@ func (s *ReplicationStream) handleCopyData(ctx context.Context, data *pgproto3.C
 		// as it has been received in full.
 		s.lastLSN.Store(uint64(xld.WALStart + pglogrepl.LSN(len(xld.WALData))))
 
-		change, err := Decode(xld.WALData, s.relations)
+		change, err := Decode(xld.WALData, s.relations, s.metrics)
 		if err != nil {
 			return fmt.Errorf("decoding WAL data: %w", err)
 		}
