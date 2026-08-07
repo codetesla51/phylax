@@ -175,7 +175,15 @@ body {
 .kpi-num.tick { animation: tick 150ms ease-out; }
 @keyframes tick { 0% { opacity: 0.35; } 100% { opacity: 1; } }
 
-.kpi-sub { margin: 10px 0 0; font: 400 clamp(10px, 0.3vw + 9.5px, 11px)/1.3 "Fira Code", ui-monospace, monospace; color: var(--faint); }
+.kpi-sub { margin: 10px 0 0; font: 400 clamp(10px, 0.3vw + 9.5px, 11px)/1.3 "Fira Code", ui-monospace, monospace; color: var(--faint); min-height: 1.4em; }
+
+.kpi-sub.warn {
+  display: inline-block;
+  border: 1px solid var(--border);
+  background: var(--solid); color: var(--bg);
+  padding: 2px 7px; border-radius: 4px;
+  font-weight: 600;
+}
 
 /* lag card grows the sparkline */
 
@@ -326,10 +334,12 @@ body {
       <article class="kpi">
         <p class="kpi-label">changes processed</p>
         <p class="kpi-num" id="kpi-processed">–</p>
+        <p class="kpi-sub" id="procRateLine"></p>
       </article>
       <article class="kpi">
         <p class="kpi-label">changes dropped</p>
         <p class="kpi-num" id="kpi-dropped">–</p>
+        <p class="kpi-sub" id="dropRateLine"></p>
       </article>
       <article class="kpi">
         <p class="kpi-label">subscribers</p>
@@ -339,6 +349,7 @@ body {
         <p class="kpi-label">replication lag</p>
         <p class="kpi-num" id="kpi-lag">–</p>
         <canvas class="lag-chart" id="lagChart" aria-label="Replication lag over the last 60 seconds"></canvas>
+        <p class="kpi-sub" id="lagTrendLine"></p>
       </article>
     </section>
 
@@ -380,6 +391,7 @@ const els = {
   themeBtn: $("themeBtn"), themeLabel: $("themeLabel"), themeIcon: $("themeIcon"),
   processed: $("kpi-processed"), dropped: $("kpi-dropped"),
   subscribers: $("kpi-subscribers"), lag: $("kpi-lag"),
+  procRateLine: $("procRateLine"), dropRateLine: $("dropRateLine"), lagTrendLine: $("lagTrendLine"),
   chart: $("lagChart"), feedEmpty: $("feedEmpty"),
   feedRows: $("feedRows"), feedMeta: $("feedMeta"),
 };
@@ -392,6 +404,9 @@ const state = {
   feed: [],                // {time, t, table, op, row} — newest first, mirrors the DOM
   window: [],              // change timestamps for the throughput estimate
   feedCount: 0,
+  pending: [],             // changes waiting for the next batched DOM flush
+  metricsPrev: null,       // {t, processed, dropped} for per-second rates
+  lossWindow: [],          // {t, proc, drop} snapshots for the 10s delivery-loss readout
   reducedMotion: window.matchMedia("(prefers-reduced-motion: reduce)").matches,
 };
 
@@ -408,6 +423,12 @@ const fmtAgo = (ms) => {
   const s = Math.max(0, Math.round(ms / 1000));
   if (s < 60) return s + "s ago";
   return Math.floor(s / 60) + "m " + (s % 60) + "s ago";
+};
+const fmtCompact = (n) => {
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (n >= 1e4) return Math.round(n / 1e3) + "k";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+  return nf.format(Math.round(n));
 };
 
 // ── KPIs ────────────────────────────────────────────────────────────
@@ -427,14 +448,61 @@ function applyMetrics(snap) {
   tickNum(els.dropped, fmtCount(snap.changes_dropped));
   tickNum(els.subscribers, fmtCount(snap.subscribers));
   tickNum(els.lag, fmtBytes(snap.replication_lag_bytes));
-  state.lastFrameAt = Date.now();
+
+  // per-second rates + a rolling 10s delivery-loss readout
+  const now = Date.now();
+  const prev = state.metricsPrev;
+  if (prev) {
+    const dt = Math.max((now - prev.t) / 1000, 0.001);
+    const procDelta = Math.max(snap.changes_processed - prev.processed, 0);
+    const dropDelta = Math.max(snap.changes_dropped - prev.dropped, 0);
+    els.procRateLine.textContent = procDelta / dt >= 1 ? "~" + fmtCompact(procDelta / dt) + "/s" : "";
+    if (dropDelta > 0) {
+      els.dropRateLine.textContent = "+" + fmtCompact(dropDelta / dt) + "/s lost";
+      els.dropRateLine.classList.add("warn");
+    } else {
+      els.dropRateLine.textContent = "";
+      els.dropRateLine.classList.remove("warn");
+    }
+  }
+  state.lossWindow.push({ t: now, proc: snap.changes_processed, drop: snap.changes_dropped });
+  const lossCutoff = now - 10_000;
+  while (state.lossWindow.length && state.lossWindow[0].t < lossCutoff) state.lossWindow.shift();
+  if (state.lossWindow.length >= 2) {
+    const a = state.lossWindow[0], b = state.lossWindow[state.lossWindow.length - 1];
+    const p = Math.max(b.proc - a.proc, 0), d = Math.max(b.drop - a.drop, 0);
+    const total = p + d;
+    if (total > 0) {
+      const lossPct = (d / total) * 100;
+      if (lossPct >= 0.05) {
+        els.dropRateLine.textContent = "+" + fmtCompact(d / Math.max((b.t - a.t) / 1000, 1)) + "/s · " + lossPct.toFixed(1) + "% lost";
+        els.dropRateLine.classList.add("warn");
+      }
+    }
+  }
+  state.metricsPrev = { t: now, processed: snap.changes_processed, dropped: snap.changes_dropped };
+
+  state.lastFrameAt = now;
   els.freshness.textContent = "now";
   els.freshnessSep.hidden = false;
-  if (!state.paused) {
-    state.lagSamples.push({ t: state.lastFrameAt, bytes: snap.replication_lag_bytes });
-    trimSamples();
-    drawLag();
-  }
+  state.lagSamples.push({ t: now, bytes: snap.replication_lag_bytes });
+  trimSamples();
+  updateLagTrend();
+  drawLag();
+}
+
+// lag trend: encodes the README's interpretation — plateau = normal pipeline
+// depth, climb = falling behind, drain to 0 = healthy.
+function updateLagTrend() {
+  const s = state.lagSamples;
+  const line = els.lagTrendLine;
+  if (s.length < 3) { line.textContent = ""; return; }
+  const cur = s[s.length - 1].bytes;
+  const base = s[Math.max(s.length - 4, 0)].bytes; // ~3s back
+  if (cur < 2048 && base < 2048) { line.textContent = "at 0 — healthy"; return; }
+  if (cur > base * 1.25 + 1024) line.textContent = "climbing — falling behind";
+  else if (cur < base * 0.8) line.textContent = "draining";
+  else line.textContent = "steady";
 }
 
 // ── lag sparkline ───────────────────────────────────────────────────
@@ -544,46 +612,79 @@ function updateFeedMeta() {
   els.feedMeta.textContent = meta;
 }
 
+// changes enqueue cheaply; the DOM work is batched into rAF flushes so a
+// burst of thousands of events costs one layout pass per frame, not one per
+// event — this is the browser-side half of the drop-on-full story.
 function addChange(change) {
   if (state.paused) return;
-  if (state.feedCount === 0) els.feedEmpty.hidden = true;
-
-  const row = document.createElement("div");
-  row.className = "feed-row";
-
-  const time = document.createElement("span");
-  time.className = "feed-time";
-  time.textContent = fmtTime(new Date());
-
-  const op = document.createElement("span");
-  op.className = "op " + (opClass[change.Operation] || "op-insert");
-  op.textContent = (opGlyph[change.Operation] || "+") + " " + change.Operation;
-
-  const table = document.createElement("span");
-  table.className = "feed-table";
-  table.textContent = change.Table;
-
-  const detail = document.createElement("span");
-  detail.className = "feed-detail";
-  detail.textContent = rowSummary(change);
-  detail.title = rowSummary(change);
-
-  row.append(time, op, table, detail);
-  els.feedRows.prepend(row);
-
-  const summary = rowSummary(change);
-  state.feed.unshift({ time: fmtTime(new Date()), t: Date.now(), table: change.Table, op: change.Operation, row: summary });
   state.feedCount++;
-  while (state.feed.length > cfg.feedLimit) state.feed.pop();
-  while (els.feedRows.children.length > cfg.feedLimit) els.feedRows.lastChild.remove();
+  if (state.feedCount === 1) els.feedEmpty.hidden = true;
 
-  // throughput estimate: change timestamps within the last 60s
   const now = Date.now();
   state.window.push(now);
   const cutoff = now - cfg.rateWindowMs;
   while (state.window.length && state.window[0] < cutoff) state.window.shift();
 
+  state.pending.push(change);
+  scheduleFlush();
   updateFeedMeta();
+}
+
+let flushScheduled = false;
+function scheduleFlush() {
+  if (flushScheduled || state.paused) return;
+  flushScheduled = true;
+  requestAnimationFrame(() => {
+    flushScheduled = false;
+    flushFeed();
+  });
+}
+
+function flushFeed() {
+  if (state.paused) return;
+  const batch = state.pending;
+  if (!batch.length) return;
+  state.pending = [];
+
+  // bound the DOM work per frame; leftovers drain on the next frame
+  const budget = Math.max(cfg.feedLimit * 2, 100);
+  const take = batch.slice(0, budget);
+  if (batch.length > budget) state.pending = batch.slice(budget).concat(state.pending);
+
+  const frag = document.createDocumentFragment();
+  for (const change of take) {
+    const row = document.createElement("div");
+    row.className = "feed-row";
+
+    const time = document.createElement("span");
+    time.className = "feed-time";
+    time.textContent = fmtTime(new Date());
+
+    const op = document.createElement("span");
+    op.className = "op " + (opClass[change.Operation] || "op-insert");
+    op.textContent = (opGlyph[change.Operation] || "+") + " " + change.Operation;
+
+    const table = document.createElement("span");
+    table.className = "feed-table";
+    table.textContent = change.Table;
+
+    const summary = rowSummary(change);
+    const detail = document.createElement("span");
+    detail.className = "feed-detail";
+    detail.textContent = summary;
+    detail.title = summary;
+
+    row.append(time, op, table, detail);
+    frag.appendChild(row);
+
+    state.feed.unshift({ time: fmtTime(new Date()), t: Date.now(), table: change.Table, op: change.Operation, row: summary });
+  }
+  while (state.feed.length > cfg.feedLimit) state.feed.pop();
+
+  els.feedRows.prepend(frag);
+  while (els.feedRows.children.length > cfg.feedLimit) els.feedRows.lastChild.remove();
+
+  if (state.pending.length) scheduleFlush();
 }
 
 // ── status / health ─────────────────────────────────────────────────
