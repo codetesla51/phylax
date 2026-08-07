@@ -29,11 +29,11 @@ Not the right fit for exactly-once delivery, multi-slot HA, or frequent schema e
 **Requirements:** PostgreSQL with `wal_level = logical` and a role with `REPLICATION` privileges.
 
 ```bash
-docker run -d --name phy -e POSTGRES_PASSWORD=1 -p 5432:5432 postgres:16 -c wal_level=logical
+docker run -d --name pg -e POSTGRES_PASSWORD=secret -p 5432:5432 postgres:16 -c wal_level=logical
 ```
 
 ```bash
-go run ./cmd/phylax --dsn 'postgres://user:pass@localhost:5432/db' --tables users,orders
+go run ./cmd/phylax --dsn 'postgres://postgres:secret@localhost:5432/mydb' --tables users,orders
 ```
 
 That's it — the CLI creates its own slot and publication, starts replicating, and serves the console:
@@ -117,6 +117,8 @@ log.Fatal(cdc.Start(context.Background()))
 | `/metrics/stream`| a JSON metrics snapshot every second (`changes_processed`, `changes_dropped`, `subscribers`, `replication_lag_bytes`) |
 | `/dashboard`     | the embedded console page (`go:embed`, no static files to ship)       |
 
+**Delivery buffers.** Every `/events` subscriber gets a bounded channel — **10 events** for SSE subscribers, **100** for the `OnChange` consumer — sized at `Broadcaster.Subscribe(id, bufferSize)` time in code (constants in `sse.go` / `cdc.go`, not exposed via config or CLI). A full buffer drops the change and counts it in `changes_dropped` rather than stalling the stream.
+
 ```go
 srv := cdc.Server()
 log.Fatal(srv.ListenAndServe(":8080"))
@@ -141,22 +143,26 @@ log.Fatal(srv.ListenAndServe(":8080"))
 
 ## Performance
 
-Measured with a write-heavy [barrage](https://github.com/codetesla51/barrage) ladder (500 → 2000 → 5000 writes/s, 30s runs) against a local Postgres 16:
+Measured against a local Postgres 16 (Docker) with the checked-in [barrage](https://github.com/codetesla51/barrage) configs. One conclusion across every run: **the decode path was never the bottleneck — Postgres's commit rate and the SSE fan-out were.**
 
-| Rate (target) | Changes generated | Consumed | Drops |
-| ------------- | ----------------- | -------- | ----- |
-| 500/s         | ~12.4k            | all      | 0     |
-| 2000/s        | ~49.5k            | all      | 0     |
-| 5000/s        | ~123.8k (actual 4,583/s — the generator topped out) | all | ~2.5% cumulative, delivery-side |
+**Single-row ladder (no subscribers):** the 500 → 2000 → 5000 writes/s configs established the single-row generator ceiling at **4,583 changes/s** — Postgres, not barrage, not phylax, topped out. Decode consumed 100% at every rate; lag drained to 0.
 
-Read carefully, because the numbers cut both ways:
+**Subscriber matrix (batched multi-row inserts, 50,000 changes/s target, 30s runs):**
 
-- **The generator, not phylax, was the constraint at 5,000/s.** Postgres delivered 4,583/s and no more, so phylax's *consume* ceiling was never reached — treat 4,583 changes/s as a tested floor.
-- **The decode path kept pace at every rate** — everything generated was consumed; lag stayed flat and drained to 0.
-- **The drops were delivery-side, not consumption** — per-subscriber buffers filling during SSE fan-out to browser tabs (their distribution across runs is unknown).
-- **The no-subscriber ceiling is higher and unmeasured** — without SSE clients the bottleneck moves to decode + JSON.
+| Subscribers | Generated | Decode consumed | Drops | Per-sub received |
+| ----------- | --------- | --------------- | ----- | ---------------- |
+| 11 (10 headless + 1 tab) | ~1.285M | 1,285,500 (100%) | ~1.05M/sub | ~15% |
+| 3 (2 headless + 1 tab)   | ~1.284M | 1,284,900 (100%) | ~776k/sub | ~27% |
+| 1 (dashboard tab)        | ~1.248M | 1,248,200 (100%) | ~340k | ~73% |
 
-Reproduce with the checked-in configs: `barrage run -c barrage-ceiling-500.yml`.
+What the numbers mean:
+
+- **Postgres is the generator wall.** With 50-row batched inserts the target was 50,000 changes/s; Postgres committed **~37,000/s max** (barrage hit 917 of its 1,000 statements/s — the failed remainder is DB saturation at concurrency 100, success 90.7–93.4%). Batching raised that wall 8× over single-row inserts (4,583 → ~37k changes/s).
+- **The decode path is unbounded at these rates** — 100% consumed in every run, lag pinned at 0.
+- **Delivery is subscriber math.** Each SSE subscriber is a goroutine writing one event per change; under load that path sustains roughly **26k events/s for one subscriber** and less per subscriber as the count grows (CPU contention). At ~37k changes/s: 1 subscriber sees 73% of the stream, 3 see ~27% each, 11 see ~15% each. The rest is dropped and counted in `changes_dropped` — by design, a slow subscriber never stalls the stream.
+- **The no-subscriber ceiling is still unmeasured** — the generator walls out first.
+
+Reproduce: `barrage run -c benchmarks/barrage-ceiling-5000.yml` (single-row ladder) or `barrage run -c benchmarks/barrage-ceiling-50k.yml` (batched matrix; subscriber counts are recorded live on the console's `subscribers` gauge). The `benchmarks/` directory holds all configs plus a sample `report.html` from the last run.
 
 > [!TIP]
 > On the lag sparkline: a **plateau** during steady writes is normal pipeline depth; a **climb** while writes continue means the consumer is falling behind; a quick **drain to 0** after writes stop is proof of health.
@@ -168,8 +174,9 @@ Each trade-off is a choice, not an oversight — what you give up, why, and when
 | Limitation | Why it's deliberate | When to outgrow it |
 | ---------- | ------------------- | ------------------ |
 | **Best-effort delivery** — 3 webhook retries, then drop; no durable outbox | Keeps memory bounded; the slot is the safety net (at-least-once) | Need exactly-once → add an outbox between phylax and the consumer |
-| **Drop-on-full subscribers** — a slow consumer's 100-entry buffer fills; drops are counted | A subscriber must never stall the stream | Consumers can't keep pace → speed them up or watch `changes_dropped` |
-| **Delivery-bound, not decode-bound** — the consume path kept pace with everything generated in testing; observed loss was subscriber delivery ([Performance](#performance)) | Drops are the designed degradation path | Sustained high write rates → batch SSE writes, go binary, or fan out consumers |
+| **Drop-on-full subscribers** — SSE subscribers hold a **10-event buffer** (100 for the `OnChange` consumer); sizes are set in code at `Subscribe(id, size)` time, not via config; a full buffer drops the change (counted) | A subscriber must never stall the stream | Consumers can't keep pace → speed them up or watch `changes_dropped` |
+| **Ghost subscribers** — an SSE client that drops its connection without a clean close stays registered until the next write fails, so `subscribers` can lag reality while idle | Unsubscribe-on-write-error is simple and correct-enough | Need exact live counts → heartbeat or read-side EOF detection |
+| **Delivery-bound, not decode-bound** — decode consumed 100% at every tested rate (up to ~37k changes/s); the walls are Postgres's commit rate and SSE fan-out ([Performance](#performance)) | Drops are the designed degradation path | Sustained high write rates → batch SSE writes, go binary, or fan out consumers |
 | **Text tuples, string values** — no binary protocol, no typed decode | Text mode is the simplest correct path | Need typed values → decode binary or convert downstream |
 | **Key-only old rows** (`REPLICA IDENTITY DEFAULT`) | Leaner WAL; identity + new state covers most consumers | Need before-images → `REPLICA IDENTITY FULL` |
 | **No auth on the console** | Localhost/dev convenience, not a product | Public exposure → auth proxy or `--no-http` |
@@ -188,4 +195,4 @@ Each trade-off is a choice, not an oversight — what you give up, why, and when
 | `dashboard.go`/`html`| Embedded console served at `/dashboard`                              |
 | `metrics.go`         | Live counters (`Metrics`) and `MetricsSnapshot`                      |
 | `cmd/phylax/main.go` | CLI entry point: flags, webhook client, console server               |
-| `barrage-ceiling-*.yml` | Load-test configs used for the performance numbers above          |
+| `benchmarks/`       | Barrage load-test configs (single-row ladder + 50k batched matrix) and a sample `report.html` from the last run |

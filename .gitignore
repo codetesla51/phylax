@@ -1,2 +1,6 @@
 # Binary produced by `go build ./cmd/phylax` from the repo root.
 /phylax
+
+# Generated barrage reports (written into the CWD you run barrage from).
+/report.html
+/benchmarks/report.html
