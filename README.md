@@ -12,7 +12,7 @@
 
 </div>
 
-phylax connects to PostgreSQL, creates its own replication slot and publication, and streams every row change (`insert` / `update` / `delete`) to your code in real time — to stdout, to an HTTP webhook, or to an embedded live console with SSE metrics. It reconnects with backoff, resumes from the slot's saved position, and stays out of your way.
+phylax connects to PostgreSQL, creates its own replication slot and publication, and streams every row change (`insert` / `update` / `delete`) to your code as it happens — to stdout, a webhook, or the embedded live console. It reconnects with backoff and resumes from the slot's saved position, so a restart loses nothing.
 
 ## Why phylax?
 
@@ -47,25 +47,32 @@ That's it — the CLI creates its own slot and publication, starts replicating, 
 
 ## Features
 
-- **Real-time row changes** — `insert` / `update` / `delete` with full row data, streamed as they happen
-- **Self-provisioning** — creates its own replication slot and publication; idempotent, restart-safe
-- **Resume from LSN** — reconnects with exponential backoff (1s → 30s) and picks up from the slot's confirmed position
-- **Embedded console** — a single self-contained HTML dashboard (`/dashboard`) with KPI cards, a 60-second log-scale lag sparkline, a change feed with CSV export, and dark/light mode
-- **SSE endpoints** — `/events` and `/metrics/stream` out of the box, served by one `http.Server`
-- **Webhook delivery** — POST each change to an endpoint with bounded retry
-- **Zero-state safe** — a zero-value `Server` works; slow subscribers never stall replication
+- **Real-time row changes** — `insert` / `update` / `delete` as they commit
+- **Self-provisioning** — creates its own slot + publication, idempotent and restart-safe
+- **Resume from LSN** — backoff reconnect (1s → 30s); picks up exactly where it left off
+- **Embedded console** — a self-contained dashboard at `/dashboard`: KPI cards, log-scale lag sparkline, live feed with CSV export, dark/light mode
+- **SSE endpoints** — `/events` and `/metrics/stream` from one `http.Server`
+- **Webhook delivery** — POST each change to an endpoint, bounded retries
+- **Zero-state safe** — a zero-value `Server` works; slow subscribers never stall the stream
 
 ## How it works
 
-1. **Connect** — two connections: a *replication* connection (DSN + `replication=database`) and an *admin* connection for SQL.
-2. **Resume** — `IDENTIFY_SYSTEM` locates the server; if the slot has a confirmed flush position, streaming resumes there.
-3. **Provision** — the slot (`pgoutput` plugin) and publication are created if missing.
-4. **Stream** — `START_REPLICATION` loops over messages: answers keepalives, decodes `XLogData` into `Change` values, dispatches them, and sends standby status so the server can advance the slot and recycle WAL.
+1. **Connect** — opens a replication connection and an admin connection to the same database.
+2. **Resume** — picks up from the slot's saved position, or starts fresh if there's none.
+3. **Provision** — creates its slot and publication if they don't exist yet.
+4. **Stream** — decodes WAL into `Change` values, dispatches them to your handlers, and tells the server to advance the slot.
 
 ## CLI
 
-```console
-$ go run ./cmd/phylax --dsn 'postgres://user:pass@localhost:5432/db' --tables users,orders
+Stream changes to stdout:
+
+```bash
+go run ./cmd/phylax --dsn 'postgres://user:pass@localhost:5432/db' --tables users,orders
+```
+
+Every change prints as one JSON object per line:
+
+```json
 {"Table":"users","Operation":"insert","OldRow":null,"NewRow":{"email":"a@b.c","name":"Alice"}}
 ```
 
@@ -80,7 +87,7 @@ $ go run ./cmd/phylax --dsn 'postgres://user:pass@localhost:5432/db' --tables us
 | `--no-http`     | `false`            | disable the HTTP console                             |
 | `-v`            | `false`            | debug-level logging (protocol traffic, raw WAL)      |
 
-`--webhook` POSTs each change as JSON with up to 3 retries (1s/2s/3s backoff); after 3 failures the change is logged and dropped — the webhook must never stall replication.
+`--webhook` POSTs each change as JSON, retrying up to 3 times (1s/2s/3s backoff) before giving up — a slow webhook must never stall replication.
 
 ## Library
 
@@ -144,10 +151,10 @@ Measured with a write-heavy [barrage](https://github.com/codetesla51/barrage) la
 
 Read carefully, because the numbers cut both ways:
 
-- **The generator, not phylax, was the constraint at 5,000/s.** Postgres in this test delivered 4,583/s and no more, so phylax's *consume* ceiling was never reached — 4,583 changes/s is a tested floor, not a ceiling.
-- **The decode/stream path kept pace at every rate**: everything generated was consumed, lag stayed flat, and drained to 0 when writes stopped.
-- **The observed drops were subscriber delivery, not consumption** — per-subscriber buffers filling during the console's SSE fan-out to browser tabs (drops can only happen there by construction; their distribution across runs is unknown).
-- **The no-subscriber ceiling is higher and unmeasured**: with plain `OnChange` or a webhook, the per-event socket writes disappear and the bottleneck moves to decode + JSON.
+- **The generator, not phylax, was the constraint at 5,000/s.** Postgres delivered 4,583/s and no more, so phylax's *consume* ceiling was never reached — treat 4,583 changes/s as a tested floor.
+- **The decode path kept pace at every rate** — everything generated was consumed; lag stayed flat and drained to 0.
+- **The drops were delivery-side, not consumption** — per-subscriber buffers filling during SSE fan-out to browser tabs (their distribution across runs is unknown).
+- **The no-subscriber ceiling is higher and unmeasured** — without SSE clients the bottleneck moves to decode + JSON.
 
 Reproduce with the checked-in configs: `barrage run -c barrage-ceiling-500.yml`.
 
@@ -160,14 +167,14 @@ Each trade-off is a choice, not an oversight — what you give up, why, and when
 
 | Limitation | Why it's deliberate | When to outgrow it |
 | ---------- | ------------------- | ------------------ |
-| **Best-effort delivery** — webhook gets 3 tries, then the change is dropped; no durable outbox | Bounded memory; the slot is the safety net (at-least-once across restarts) | Need durable/exactly-once → add an outbox or queue between phylax and the consumer |
-| **Drop-on-full subscribers** — a slow consumer's 100-entry buffer fills and changes are dropped (counted) | A subscriber must never stall the stream | Consumers can't keep pace → process faster or watch `changes_dropped` |
-| **Throughput is delivery-bound, not decode-bound** — the consume path kept pace with everything generated in testing (see [Performance](#performance)); the observed ceiling was subscriber delivery, and the no-subscriber ceiling is unmeasured | Simplicity over peak performance; drops are the designed degradation path | Sustained high write rates → benchmark your shape, then batch SSE writes, go binary, or fan out consumers |
-| **Text-format tuples, values are strings** — no binary protocol, no typed decode | pgoutput text mode is the simplest correct path | Need typed values at the source → decode binary or convert downstream |
+| **Best-effort delivery** — 3 webhook retries, then drop; no durable outbox | Keeps memory bounded; the slot is the safety net (at-least-once) | Need exactly-once → add an outbox between phylax and the consumer |
+| **Drop-on-full subscribers** — a slow consumer's 100-entry buffer fills; drops are counted | A subscriber must never stall the stream | Consumers can't keep pace → speed them up or watch `changes_dropped` |
+| **Delivery-bound, not decode-bound** — the consume path kept pace with everything generated in testing; observed loss was subscriber delivery ([Performance](#performance)) | Drops are the designed degradation path | Sustained high write rates → batch SSE writes, go binary, or fan out consumers |
+| **Text tuples, string values** — no binary protocol, no typed decode | Text mode is the simplest correct path | Need typed values → decode binary or convert downstream |
 | **Key-only old rows** (`REPLICA IDENTITY DEFAULT`) | Leaner WAL; identity + new state covers most consumers | Need before-images → `REPLICA IDENTITY FULL` |
 | **No auth on the console** | Localhost/dev convenience, not a product | Public exposure → auth proxy or `--no-http` |
 | **Single slot / stream / process** — no sharding, no HA | Simplest correct model for a minimal client | Scale-out → partition by slot or add leader election |
-| **No DDL handling** — schema changes on published tables can desync decoding | Out of scope for a minimal client | Frequent schema evolution → use a battle-tested CDC (Debezium) |
+| **No DDL handling** — schema changes can desync decoding | Out of scope for a minimal client | Frequent schema evolution → use a battle-tested CDC (Debezium) |
 
 ## Project layout
 
