@@ -45,6 +45,24 @@ Not the right fit for exactly-once delivery, multi-slot HA, or frequent schema e
 docker run -d --name pg -e POSTGRES_PASSWORD=secret -p 5432:5432 postgres:16 -c wal_level=logical
 ```
 
+> [!NOTE]
+> Not using Docker? The server-side setup is just two `psql` commands — set `wal_level = logical`, restart PostgreSQL, and give a role `REPLICATION` privileges. No container needed.
+
+```sql
+-- as a superuser, once:
+ALTER SYSTEM SET wal_level = logical;
+
+-- wal_level only takes effect at startup, so restart PostgreSQL:
+--   sudo systemctl restart postgresql    (Debian/Ubuntu)
+--   sudo systemctl restart postgresql    (RHEL/Fedora/Arch)
+--   pg_ctl restart -D /var/lib/postgresql/16/main
+
+-- then create a role phylax can connect as:
+CREATE ROLE repl WITH LOGIN REPLICATION PASSWORD 'secret';
+```
+
+(For the CLI example below, use your own role and database — e.g. `postgres://repl:secret@localhost:5432/mydb` if you followed the psql path above.)
+
 Install the CLI, then start it:
 
 ```bash
