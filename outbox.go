@@ -45,6 +45,7 @@ type OutboxConsumer struct {
 	maxRetries  int
 	baseBackoff time.Duration
 	tableName   string
+	mu          sync.Mutex
 	sem         chan struct{}      // bounds concurrent drainer goroutines
 	topics      sync.Map          // topic -> *topicQueue
 }
@@ -179,6 +180,8 @@ func (oc *OutboxConsumer) deliverWithRetry(ctx context.Context, row *OutboxRow) 
 }
 
 func (oc *OutboxConsumer) ack(ctx context.Context, id int64) error {
+	oc.mu.Lock()
+	defer oc.mu.Unlock()
 	_, err := oc.db.Exec(ctx, `UPDATE outbox SET delivered_at = now() WHERE id = $1`, id)
 	return err
 }

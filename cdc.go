@@ -205,7 +205,13 @@ func (c *CDC) runOnce(ctx context.Context) error {
 
 	// 4. Run the replication loop. Every decoded change is fanned out to
 	// the CDC broadcaster, which is what OnChange subscribers receive.
-	stream, err := NewReplicationStream(ctx, replConn, c.clientConfig(), resumeLSN, slog.Default(), c.publishChange, adminConn, c.deliverOutbox, c.cfg.OutboxTable)
+	// The outbox consumer gets its own connection for acks: pgx.Conn is not
+	// safe for concurrent use, and the drainers ack in parallel.
+	outboxConn, err := OpenAdminConnection(ctx, c.cfg.DSN)
+	if err != nil {
+		return err
+	}
+	stream, err := NewReplicationStream(ctx, replConn, c.clientConfig(), resumeLSN, slog.Default(), c.publishChange, outboxConn, c.deliverOutbox, c.cfg.OutboxTable)
 	if err != nil {
 		return err
 	}
