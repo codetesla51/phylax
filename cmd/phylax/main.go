@@ -29,15 +29,15 @@ import (
 
 // options holds every CLI flag.
 type options struct {
-	dsn          string
-	tables       string
-	webhook      string
-	slot         string
-	publication  string
-	outboxTable  string
-	addr         string
-	noHTTP       bool
-	verbose      bool
+	dsn         string
+	tables      string
+	webhook     string
+	slot        string
+	publication string
+	outboxTable string
+	addr        string
+	noHTTP      bool
+	verbose     bool
 }
 
 func main() {
