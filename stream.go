@@ -99,6 +99,15 @@ func NewReplicationStream(ctx context.Context, conn *pgconn.PgConn, cfg ClientCo
 	return s, nil
 }
 
+// OutboxStats returns the outbox consumer's live counters (0 when outbox is
+// disabled). Read by CDC.MetricsSnapshot for the dashboard.
+func (s *ReplicationStream) OutboxStats() (delivered, inflight, failed int64) {
+	if s.outboxConsumer == nil {
+		return 0, 0, 0
+	}
+	return s.outboxConsumer.Stats()
+}
+
 // Broadcaster returns the stream's fan-out broadcaster. Every decoded
 // change is published to it, so subscribers receive each change as it
 // streams in.

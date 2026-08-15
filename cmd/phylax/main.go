@@ -29,14 +29,15 @@ import (
 
 // options holds every CLI flag.
 type options struct {
-	dsn         string
-	tables      string
-	webhook     string
-	slot        string
-	publication string
-	addr        string
-	noHTTP      bool
-	verbose     bool
+	dsn          string
+	tables       string
+	webhook      string
+	slot         string
+	publication  string
+	outboxTable  string
+	addr         string
+	noHTTP       bool
+	verbose      bool
 }
 
 func main() {
@@ -56,6 +57,7 @@ func parseFlags() *options {
 	flag.StringVar(&opts.tables, "tables", "", "comma-separated tables to replicate (required)")
 	flag.StringVar(&opts.webhook, "webhook", "", "URL to POST each change to (optional)")
 	flag.StringVar(&opts.slot, "slot", "", "replication slot name (default: phylax.Config default)")
+	flag.StringVar(&opts.outboxTable, "outbox-table", "", "table whose inserts are treated as outbox messages (optional)")
 	flag.StringVar(&opts.publication, "publication", "", "publication name (default: phylax.Config default)")
 	flag.StringVar(&opts.addr, "addr", ":8080", "HTTP listen address for the console (dashboard + SSE)")
 	flag.BoolVar(&opts.noHTTP, "no-http", false, "disable the HTTP console server")
@@ -84,6 +86,7 @@ func run(opts *options) error {
 		Tables:          splitTables(opts.tables),
 		SlotName:        opts.slot,
 		PublicationName: opts.publication,
+		OutboxTable:     opts.outboxTable,
 	}
 
 	cdc, err := phylax.New(cfg)

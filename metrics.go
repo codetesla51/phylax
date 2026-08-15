@@ -1,11 +1,12 @@
 // metrics.go — the live, in-memory counters exposed by the metrics SSE
 // stream (/metrics/stream).
 //
-// A snapshot is assembled on demand from three in-memory sources, none of
-// which touch Postgres: the decode counter on the current replication
-// stream (ChangesProcessed), the change broadcaster's per-subscriber drop
-// counters (ChangesDropped, Subscribers), and the stream's existing LSN
-// tracking (ReplicationLag).
+// A snapshot is assembled on demand from in-memory sources, none of which
+// touch Postgres: the decode counter on the current replication stream
+// (ChangesProcessed), the change broadcaster's per-subscriber drop counters
+// (ChangesDropped, Subscribers), the stream's existing LSN tracking
+// (ReplicationLag), and the outbox consumer's delivery counters
+// (OutboxDelivered, OutboxInflight, OutboxFailed).
 
 package phylax
 
@@ -24,6 +25,9 @@ type MetricsSnapshot struct {
 	ChangesDropped   int64  `json:"changes_dropped"`
 	Subscribers      int    `json:"subscribers"`
 	ReplicationLag   uint64 `json:"replication_lag_bytes"`
+	OutboxDelivered  int64  `json:"outbox_delivered"`
+	OutboxInflight   int64  `json:"outbox_inflight"`
+	OutboxFailed     int64  `json:"outbox_failed"`
 }
 
 // MetricsProvider supplies the live metrics snapshot. It is implemented by

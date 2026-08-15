@@ -7,6 +7,7 @@ import (
 	"log"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -46,8 +47,13 @@ type OutboxConsumer struct {
 	baseBackoff time.Duration
 	tableName   string
 	mu          sync.Mutex
-	sem         chan struct{}      // bounds concurrent drainer goroutines
-	topics      sync.Map          // topic -> *topicQueue
+	sem         chan struct{} // bounds concurrent drainer goroutines
+	topics      sync.Map      // topic -> *topicQueue
+
+	// metrics are atomic and read by the dashboard's metrics stream.
+	delivered atomic.Int64 // cumulative successful deliveries (acked)
+	inflight  atomic.Int64 // rows currently being delivered (gauge)
+	failed    atomic.Int64 // cumulative rows that exhausted retries
 }
 
 // topicQueue holds the per-topic delivery channel and a one-shot starter for
@@ -68,6 +74,13 @@ func NewOutboxConsumer(db *pgx.Conn, deliver DeliveryFunc, tableName string) *Ou
 		tableName:   tableName,
 		sem:         make(chan struct{}, 64), // max concurrent topic drainers
 	}
+}
+
+// Stats returns the outbox consumer's live counters for the metrics stream:
+// cumulative delivered, currently in-flight, and cumulative failed (rows
+// that exhausted retries and were left pending).
+func (oc *OutboxConsumer) Stats() (delivered, inflight, failed int64) {
+	return oc.delivered.Load(), oc.inflight.Load(), oc.failed.Load()
 }
 
 // ToOutboxRow converts a decoded Change into an OutboxRow if it is an insert
@@ -156,6 +169,8 @@ func (oc *OutboxConsumer) enqueue(ctx context.Context, row *OutboxRow) {
 // failure. On success it acks the row. On exhausting retries, it logs and
 // leaves the row pending (no dead-letter table in v1).
 func (oc *OutboxConsumer) deliverWithRetry(ctx context.Context, row *OutboxRow) {
+	oc.inflight.Add(1)
+	defer oc.inflight.Add(-1)
 	var lastErr error
 	for attempt := 0; attempt <= oc.maxRetries; attempt++ {
 		if attempt > 0 {
@@ -172,11 +187,13 @@ func (oc *OutboxConsumer) deliverWithRetry(ctx context.Context, row *OutboxRow) 
 			if ackErr := oc.ack(ctx, row.ID); ackErr != nil {
 				log.Printf("outbox: delivered row %d but failed to ack: %v", row.ID, ackErr)
 			}
+			oc.delivered.Add(1)
 			return
 		}
 	}
 
 	log.Printf("outbox: row %d failed after %d attempts, leaving pending: %v", row.ID, oc.maxRetries, lastErr)
+	oc.failed.Add(1)
 }
 
 func (oc *OutboxConsumer) ack(ctx context.Context, id int64) error {

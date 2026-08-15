@@ -102,6 +102,19 @@ func TestOutboxLive(t *testing.T) {
 	}
 	t.Logf("OK: %d/%d outbox rows delivered + acked", delivered, wantRows)
 
+	// The dashboard reads these via /metrics/stream — prove the outbox
+	// counters flow through MetricsSnapshot.
+	snap := cdc.MetricsSnapshot()
+	if snap.OutboxDelivered != int64(wantRows) {
+		t.Errorf("metrics outbox_delivered = %d, want %d", snap.OutboxDelivered, wantRows)
+	}
+	if snap.OutboxInflight != 0 {
+		t.Errorf("metrics outbox_inflight = %d, want 0 (all settled)", snap.OutboxInflight)
+	}
+	if snap.OutboxFailed != 0 {
+		t.Errorf("metrics outbox_failed = %d, want 0", snap.OutboxFailed)
+	}
+
 	// Cleanup so the test leaves no litter. The CDC holds the slot active
 	// until its replication connection closes, so retry the drops until
 	// they succeed (or we give up after a few seconds).

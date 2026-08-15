@@ -6,7 +6,8 @@
   endpoints of the phylax Server on the same origin:
 
     /metrics/stream  → {"changes_processed":N,"changes_dropped":N,
-                        "subscribers":N,"replication_lag_bytes":N}  (1/s)
+                        "subscribers":N,"replication_lag_bytes":N,
+                        "outbox_delivered":N,"outbox_inflight":N,"outbox_failed":N}  (1/s)
     /events          → {"Table":...,"Operation":...,"OldRow":...,"NewRow":...}
 
   Preview: python3 -m http.server 8000  →  http://localhost:8000/dashboard.html
@@ -158,7 +159,7 @@ body {
 
 .kpis {
   display: grid; gap: clamp(10px, 1.4vw, 14px);
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   margin-block: clamp(16px, 2.5vw, 22px);
 }
 
@@ -368,6 +369,11 @@ body {
         <canvas class="lag-chart" id="lagChart" aria-label="Replication lag over the last 60 seconds"></canvas>
         <p class="kpi-sub" id="lagTrendLine"></p>
       </article>
+      <article class="kpi kpi-outbox">
+        <p class="kpi-label">outbox delivered</p>
+        <p class="kpi-num" id="kpi-outbox">–</p>
+        <p class="kpi-sub" id="outboxSub"></p>
+      </article>
     </section>
 
     <section class="feed" aria-label="Change feed">
@@ -408,6 +414,7 @@ const els = {
   themeBtn: $("themeBtn"), themeLabel: $("themeLabel"), themeIcon: $("themeIcon"),
   processed: $("kpi-processed"), dropped: $("kpi-dropped"),
   subscribers: $("kpi-subscribers"), lag: $("kpi-lag"),
+  outbox: $("kpi-outbox"), outboxSub: $("outboxSub"),
   procRateLine: $("procRateLine"), dropRateLine: $("dropRateLine"), lagTrendLine: $("lagTrendLine"),
   chart: $("lagChart"), feedEmpty: $("feedEmpty"),
   feedRows: $("feedRows"), feedMeta: $("feedMeta"),
@@ -465,6 +472,16 @@ function applyMetrics(snap) {
   tickNum(els.dropped, fmtCount(snap.changes_dropped));
   tickNum(els.subscribers, fmtCount(snap.subscribers));
   tickNum(els.lag, fmtBytes(snap.replication_lag_bytes));
+  tickNum(els.outbox, fmtCount(snap.outbox_delivered));
+  if (snap.outbox_inflight > 0 || snap.outbox_failed > 0) {
+    els.outboxSub.textContent =
+      fmtCount(snap.outbox_inflight) + " in-flight" +
+      (snap.outbox_failed > 0 ? " · " + fmtCount(snap.outbox_failed) + " failed" : "");
+    els.outboxSub.classList.toggle("warn", snap.outbox_failed > 0);
+  } else {
+    els.outboxSub.textContent = "";
+    els.outboxSub.classList.remove("warn");
+  }
 
   // per-second rates + a rolling 10s delivery-loss readout
   const now = Date.now();

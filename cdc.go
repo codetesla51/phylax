@@ -231,6 +231,10 @@ func (c *CDC) MetricsSnapshot() MetricsSnapshot {
 	if stream != nil {
 		snap.ChangesProcessed = stream.metrics.ChangesProcessed.Load()
 		snap.ReplicationLag = stream.ReplicationLag()
+		d, inf, f := stream.OutboxStats()
+		snap.OutboxDelivered = d
+		snap.OutboxInflight = inf
+		snap.OutboxFailed = f
 	}
 	snap.ChangesDropped = c.broadcaster.ChangesDropped()
 	snap.Subscribers = c.broadcaster.SubscriberCount()

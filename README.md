@@ -117,6 +117,7 @@ Every change prints as one JSON object per line:
 | --------------- | ---------------- | ----------------------------------------------- |
 | `--dsn`         | required         | libpq connection string                         |
 | `--tables`      | required         | comma-separated tables to replicate             |
+| `--outbox-table`| —                | table whose inserts route through the outbox pipeline (see [Outbox](#outbox)) |
 | `--webhook`     | —                | POST each change to this URL                    |
 | `--slot`        | `my_slot`        | replication slot name                           |
 | `--publication` | `my_publication` | publication name                                |
@@ -125,6 +126,8 @@ Every change prints as one JSON object per line:
 | `-v`            | `false`          | debug-level logging (protocol traffic, raw WAL) |
 
 `--webhook` POSTs each change as JSON, retrying up to 3 times (1s/2s/3s backoff) before giving up — a slow webhook must never stall replication.
+
+With `--outbox-table` set, inserts on that table are consumed by the outbox pipeline — logged and acked by the built-in handler (or your `OnOutboxDelivery` when driving the library directly) — instead of printed to stdout.
 
 ## Library
 
@@ -184,8 +187,10 @@ The outbox table needs `id` (int), `topic` (text), and `payload` (JSON) columns;
 | Route             | What it serves                                                                         |
 | ----------------- | --------------------------------------------------------------------------------------- |
 | `/events`         | every change as an SSE event                                                             |
-| `/metrics/stream` | a JSON metrics snapshot every second (`changes_processed`, `changes_dropped`, `subscribers`, `replication_lag_bytes`) |
+| `/metrics/stream` | a JSON metrics snapshot every second (`changes_processed`, `changes_dropped`, `subscribers`, `replication_lag_bytes`, and the outbox counters `outbox_delivered` / `outbox_inflight` / `outbox_failed`) |
 | `/dashboard`      | the embedded console page (`go:embed`, no static files to ship)                          |
+
+The dashboard's KPI row includes a live **outbox** card — `outbox delivered` with `in-flight` / `failed` sub-lines (the latter turns red when deliveries are failing) — whenever an outbox table is configured.
 
 ```go
 srv := cdc.Server()
