@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -62,14 +63,15 @@ type ReplicationStream struct {
 	logger   *slog.Logger
 	handle   ChangeHandler
 	// broadcaster fans every decoded change out to its subscribers.
-	broadcaster *Broadcaster
+	broadcaster    *Broadcaster
+	outboxConsumer *OutboxConsumer
 }
 
 // NewReplicationStream issues START_REPLICATION for the configured slot and
 // returns a stream ready to consume. The start LSN comes from
 // IDENTIFY_SYSTEM; the server resumes from there. The publication name is
 // passed to the pgoutput plugin so it knows which tables to send.
-func NewReplicationStream(ctx context.Context, conn *pgconn.PgConn, cfg ClientConfig, startLSN pglogrepl.LSN, logger *slog.Logger, handle ChangeHandler) (*ReplicationStream, error) {
+func NewReplicationStream(ctx context.Context, conn *pgconn.PgConn, cfg ClientConfig, startLSN pglogrepl.LSN, logger *slog.Logger, handle ChangeHandler, db *pgx.Conn, delivery DeliveryFunc, outboxTable string) (*ReplicationStream, error) {
 	err := pglogrepl.StartReplication(ctx, conn, cfg.SlotName, startLSN,
 		pglogrepl.StartReplicationOptions{
 			PluginArgs: []string{
@@ -82,14 +84,15 @@ func NewReplicationStream(ctx context.Context, conn *pgconn.PgConn, cfg ClientCo
 	}
 
 	s := &ReplicationStream{
-		conn:        conn,
-		relations:   map[uint32]*pglogrepl.RelationMessage{},
-		metrics:     &Metrics{},
-		heartbeat:   cfg.HeartbeatInterval,
-		replyNow:    make(chan struct{}, 1),
-		logger:      logger,
-		handle:      handle,
-		broadcaster: NewBroadcaster(),
+		conn:           conn,
+		relations:      map[uint32]*pglogrepl.RelationMessage{},
+		metrics:        &Metrics{},
+		heartbeat:      cfg.HeartbeatInterval,
+		replyNow:       make(chan struct{}, 1),
+		logger:         logger,
+		handle:         handle,
+		broadcaster:    NewBroadcaster(),
+		outboxConsumer: NewOutboxConsumer(db, delivery, outboxTable),
 	}
 	s.lastLSN.Store(uint64(startLSN))
 	s.lastDataAt.Store(time.Now().UnixNano())
@@ -261,6 +264,7 @@ func (s *ReplicationStream) handleCopyData(ctx context.Context, data *pgproto3.C
 		s.lastDataAt.Store(time.Now().UnixNano())
 
 		changes, err := Decode(xld.WALData, s.relations, s.metrics)
+
 		if err != nil {
 			return fmt.Errorf("decoding WAL data: %w", err)
 		}
@@ -270,7 +274,11 @@ func (s *ReplicationStream) handleCopyData(ctx context.Context, data *pgproto3.C
 		// even if the handler later fails and aborts the stream.
 		for _, change := range changes {
 			s.logger.Debug("change decoded", "table", change.Table, "operation", change.Operation)
+			if s.outboxConsumer.Handle(ctx, change) {
+				continue
+			}
 			s.broadcaster.Publish(change)
+
 			if err := s.handle(change); err != nil {
 				return fmt.Errorf("change handler failed: %w", err)
 			}

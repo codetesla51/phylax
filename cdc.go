@@ -46,6 +46,8 @@ type Config struct {
 	// PublicationName is the publication whose changes are replicated.
 	// Defaults to "my_publication" when empty.
 	PublicationName string
+
+	OutboxTable string
 }
 
 const (
@@ -203,7 +205,7 @@ func (c *CDC) runOnce(ctx context.Context) error {
 
 	// 4. Run the replication loop. Every decoded change is fanned out to
 	// the CDC broadcaster, which is what OnChange subscribers receive.
-	stream, err := NewReplicationStream(ctx, replConn, c.clientConfig(), resumeLSN, slog.Default(), c.publishChange)
+	stream, err := NewReplicationStream(ctx, replConn, c.clientConfig(), resumeLSN, slog.Default(), c.publishChange, adminConn, c.deliverOutbox, c.cfg.OutboxTable)
 	if err != nil {
 		return err
 	}
@@ -320,4 +322,8 @@ func retryable(err error) bool {
 		return false
 	}
 	return true
+}
+func (c *CDC) deliverOutbox(ctx context.Context, row *OutboxRow) error {
+	slog.Info("outbox delivery", "id", row.ID, "topic", row.Topic)
+	return nil
 }
