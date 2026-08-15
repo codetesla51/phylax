@@ -8,7 +8,7 @@
 [![Go version](https://img.shields.io/github/go-mod/go-version/codetesla51/phylax?logo=go&logoColor=white&label=Go)](https://go.dev/dl/)
 [![License](https://img.shields.io/github/license/codetesla51/phylax?logo=opensourceinitiative&logoColor=white)](LICENSE)
 
-[Live demo](#live-demo) • [Why phylax](#why-phylax) • [Quick start](#quick-start) • [Features](#features) • [How it works](#how-it-works) • [CLI](#cli) • [Library](#library) • [Console](#console) • [Change payload](#understanding-the-change-payload) • [Performance](#performance) • [Limitations](#deliberate-limitations) • [Project layout](#project-layout)
+[Live demo](#live-demo) • [Why phylax](#why-phylax) • [Quick start](#quick-start) • [Features](#features) • [How it works](#how-it-works) • [CLI](#cli) • [Library](#library) • [Console](#console) • [Outbox](#outbox) • [Change payload](#understanding-the-change-payload) • [Performance](#performance) • [Limitations](#deliberate-limitations) • [Project layout](#project-layout)
 
 </div>
 
@@ -89,6 +89,7 @@ That's it — the CLI creates its own slot and publication, starts replicating, 
 - **Embedded console** — a self-contained dashboard at `/dashboard`: KPI cards, log-scale lag sparkline, live feed with CSV export, dark/light mode
 - **SSE endpoints** — `/events` and `/metrics/stream` from one `http.Server`
 - **Webhook delivery** — POST each change to an endpoint, bounded retries
+- **Transactional outbox** — intercept inserts into an outbox table and deliver them to a `DeliveryFunc` (e.g. a broker), acking once delivered; survives crashes and never stalls the stream
 - **Zero-state safe** — a zero-value `Server` works; slow subscribers never stall the stream
 
 ## How it works
@@ -168,6 +169,35 @@ log.Fatal(srv.ListenAndServe(":8080"))
 
 > [!WARNING]
 > The console endpoints are unauthenticated by design — localhost/dev only. Put them behind an auth proxy if exposed publicly, or use `--no-http`.
+
+## Outbox
+
+phylax can act as the **consumer half of the transactional outbox pattern**. Write your domain change and an outbox row in the *same* database transaction; phylax catches the outbox `insert` on the WAL, hands the row to your `DeliveryFunc` (typically a message broker publish), and acks it by setting `delivered_at`. Because the row only leaves the "pending" state after a successful delivery, a crash before the ack leaves it pending and it is **redelivered on resume** — at-least-once by design, so your `DeliveryFunc` must be idempotent.
+
+```go
+cdc, _ := phylax.New(phylax.Config{
+    DSN:         "postgres://user:pass@localhost:5432/db",
+    Tables:      []string{"users"},
+    OutboxTable: "outbox",
+})
+
+cdc.OnOutboxDelivery(func(ctx context.Context, row *phylax.OutboxRow) error {
+    return broker.Publish(ctx, row.Topic, row.Payload) // idempotent!
+})
+
+cdc.Start(ctx)
+```
+
+| Field / method          | Meaning                                                                                          |
+| ------------------------ | ------------------------------------------------------------------------------------------------ |
+| `Config.OutboxTable`     | table whose inserts are treated as outbox messages (default empty = feature off)                 |
+| `SetOutboxDelivery(fn)`  | the `DeliveryFunc`; an outbox insert returns early and never reaches `OnChange`                   |
+| `OutboxRow`              | `{ ID, Topic, Payload }` decoded from the inserted row                                |
+
+**Concurrency:** delivery is **asynchronous** so it never blocks the replication stream. Rows with the same `topic` are delivered **sequentially** (in receive order) while distinct topics run **in parallel**, capped by a semaphore. Failures retry with exponential backoff (1s → 16s, 5 attempts) before the row is left pending for the next run.
+
+> [!NOTE]
+> The acker uses its own database connection (not the shared admin connection) and serializes acks — a parallel drainer racing the admin connection would error with `conn busy`. The outbox `UPDATE` is atomic per statement; Postgres is never the bottleneck, the Go-concurrency discipline around `pgx.Conn` is.
 
 ## Understanding the change payload
 
