@@ -19,16 +19,20 @@ func TestOutboxLive(t *testing.T) {
 	if os.Getenv("PHYLAX_LIVE_TEST") == "" {
 		t.Skip("set PHYLAX_LIVE_TEST=1 (and have a logical-replication Postgres) to run")
 	}
-	dsn := os.Getenv("PHYLAX_DSN")
+	dsn := os.Getenv("PHYLAX_LIVE_DSN")
 	if dsn == "" {
 		dsn = "postgres://us:1@localhost:5432/phy?sslmode=disable"
 	}
+	// Unique slot/publication per run so the test is deterministic even if a
+	// previous run left litter behind (a logical slot replays from its own
+	// creation point, so a fresh name never sees stale rows).
+	run := fmt.Sprintf("%d", time.Now().UnixNano())
 	const (
-		slot     = "test_outbox_slot"
-		pub      = "test_outbox_pub"
 		table    = "outbox"
 		wantRows = 3
 	)
+	slot := "test_outbox_slot_" + run
+	pub := "test_outbox_pub_" + run
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -52,6 +56,12 @@ func TestOutboxLive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	// Exercise the public hook: a custom DeliveryFunc still routes through
+	// the outbox pipeline (async dispatch + ack on the dedicated connection).
+	cdc.OnOutboxDelivery(func(_ context.Context, row *OutboxRow) error {
+		t.Logf("deliver topic=%s id=%d", row.Topic, row.ID)
+		return nil
+	})
 	go func() { _ = cdc.Start(ctx) }()
 
 	// Give the stream time to create the slot + attach.
@@ -92,12 +102,24 @@ func TestOutboxLive(t *testing.T) {
 	}
 	t.Logf("OK: %d/%d outbox rows delivered + acked", delivered, wantRows)
 
-	// Cleanup so the test leaves no litter.
+	// Cleanup so the test leaves no litter. The CDC holds the slot active
+	// until its replication connection closes, so retry the drops until
+	// they succeed (or we give up after a few seconds).
 	cancel()
-	time.Sleep(1 * time.Second)
-	adm.Exec(ctx, "SELECT pg_drop_replication_slot('"+slot+"') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='"+slot+"')")
-	adm.Exec(ctx, "DROP PUBLICATION IF EXISTS "+pub)
-	adm.Exec(ctx, "DROP TABLE IF EXISTS "+table)
+	dropCtx, dropCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer dropCancel()
+	for _, stmt := range []string{
+		"SELECT pg_drop_replication_slot('" + slot + "') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='" + slot + "')",
+		"DROP PUBLICATION IF EXISTS " + pub,
+		"DROP TABLE IF EXISTS " + table,
+	} {
+		for attempt := 0; attempt < 20; attempt++ {
+			if _, err := adm.Exec(dropCtx, stmt); err == nil {
+				break
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+	}
 }
 
 func setup(ctx context.Context, t *testing.T, adm *pgx.Conn, table string) {

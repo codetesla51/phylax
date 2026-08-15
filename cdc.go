@@ -61,11 +61,12 @@ const (
 
 // CDC is a change data capture client wrapping the phylax building blocks.
 type CDC struct {
-	cfg         Config
-	broadcaster *Broadcaster
-	mu          sync.Mutex
-	subIDs      map[string]struct{} // every active OnChange subscriber id
-	nextSubID   int
+	cfg            Config
+	broadcaster    *Broadcaster
+	mu             sync.Mutex
+	subIDs         map[string]struct{} // every active OnChange subscriber id
+	nextSubID      int
+	outboxDelivery func(context.Context, *OutboxRow) error // nil → built-in logging stub
 	// stream is the currently running replication stream, replaced on every
 	// reconnect. It feeds the live metrics snapshot.
 	stream atomic.Pointer[ReplicationStream]
@@ -211,7 +212,7 @@ func (c *CDC) runOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	stream, err := NewReplicationStream(ctx, replConn, c.clientConfig(), resumeLSN, slog.Default(), c.publishChange, outboxConn, c.deliverOutbox, c.cfg.OutboxTable)
+	stream, err := NewReplicationStream(ctx, replConn, c.clientConfig(), resumeLSN, slog.Default(), c.publishChange, outboxConn, c.outboxDeliveryFunc(), c.cfg.OutboxTable)
 	if err != nil {
 		return err
 	}
@@ -332,4 +333,25 @@ func retryable(err error) bool {
 func (c *CDC) deliverOutbox(ctx context.Context, row *OutboxRow) error {
 	slog.Info("outbox delivery", "id", row.ID, "topic", row.Topic)
 	return nil
+}
+
+// OnOutboxDelivery registers the handler called for every outbox row
+// (inserts on Config.OutboxTable). The handler must be idempotent — phylax
+// delivers at-least-once, so the same row id may arrive more than once.
+// Without a handler, phylax logs each row and acks it.
+func (c *CDC) OnOutboxDelivery(fn func(context.Context, *OutboxRow) error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.outboxDelivery = fn
+}
+
+// outboxDeliveryFunc returns the user handler if set, else the built-in
+// logging stub.
+func (c *CDC) outboxDeliveryFunc() func(context.Context, *OutboxRow) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.outboxDelivery != nil {
+		return c.outboxDelivery
+	}
+	return c.deliverOutbox
 }

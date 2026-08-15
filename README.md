@@ -89,7 +89,7 @@ That's it — the CLI creates its own slot and publication, starts replicating, 
 - **Embedded console** — a self-contained dashboard at `/dashboard`: KPI cards, log-scale lag sparkline, live feed with CSV export, dark/light mode
 - **SSE endpoints** — `/events` and `/metrics/stream` from one `http.Server`
 - **Webhook delivery** — POST each change to an endpoint, bounded retries
-- **Transactional outbox** — intercept inserts into an outbox table and deliver them to a `DeliveryFunc` (e.g. a broker), acking once delivered; survives crashes and never stalls the stream
+- **Transactional outbox** — route inserts on an outbox table to a `DeliveryFunc`, async with per-topic ordering and bounded concurrency (see [Outbox](#outbox))
 - **Zero-state safe** — a zero-value `Server` works; slow subscribers never stall the stream
 
 ## How it works
@@ -146,7 +146,36 @@ cdc.OnChange(func(c *phylax.Change) {
 log.Fatal(cdc.Start(context.Background()))
 ```
 
-`Config` has four fields: `DSN` (required — no default), `Tables`, `SlotName` (default `my_slot`), and `PublicationName` (default `my_publication`). Low-level tunables (heartbeat interval, per-connection URLs) live in `ClientConfig` / `DefaultClientConfig()`.
+`Config` has five fields: `DSN` (required — no default), `Tables`, `SlotName` (default `my_slot`), `PublicationName` (default `my_publication`), and `OutboxTable` (optional — when set, inserts on that table are routed through the [outbox](#outbox) pipeline instead of to `OnChange`). Low-level tunables (heartbeat interval, per-connection URLs) live in `ClientConfig` / `DefaultClientConfig()`.
+
+## Outbox
+
+phylax can be the tail of a [transactional outbox](https://microservices.io/patterns/data/transactional-outbox.html): write your domain change and an `outbox` row in the same transaction, and phylax delivers the outbox row to your `DeliveryFunc` as the WAL commits — no polling, using the same writes your app already makes.
+
+```go
+cdc, _ := phylax.New(phylax.Config{
+    DSN:         "postgres://user:pass@localhost:5432/db",
+    Tables:      []string{"users", "outbox"},
+    OutboxTable: "outbox",
+})
+
+cdc.OnOutboxDelivery(func(ctx context.Context, row *phylax.OutboxRow) error {
+    return broker.Publish(row.Topic, row.Payload)
+})
+```
+
+The outbox table needs `id` (int), `topic` (text), and `payload` (JSON) columns; `Payload` is decoded from JSON into a `map[string]any`. On success the row is acked (`UPDATE outbox SET delivered_at = now()`); an error retries with exponential backoff (1s → 16s, 5 attempts) before the row is left pending.
+
+`OutboxRow` is `{ ID int64; Topic string; Payload map[string]any }`.
+
+**Delivery semantics:**
+
+- **Async & bounded** — every row dispatches to a per-topic drainer goroutine, so a slow or down broker never stalls WAL consumption. Topics run in parallel (capped by a semaphore of 64 drainers); within a topic, rows deliver strictly in order.
+- **At-least-once** — phylax resumes from the slot's saved position on restart and replays every outbox insert, including rows already acked. Your `DeliveryFunc` **must be idempotent**: it will see the same `row.ID` more than once.
+- **Best-effort ack** — after exhausting retries a row is left pending (no dead-letter table in v1); it replays on restart and retries again. The slot is the safety net.
+
+> [!NOTE]
+> The acker uses its own database connection (separate from the admin connection) and serializes acks. A drainer racing the admin connection would error with `conn busy` — `pgx.Conn` is not safe for concurrent use, so the ack path gets a dedicated, mutex-guarded connection. The `UPDATE` is atomic per statement; Postgres is never the bottleneck, the Go-concurrency discipline is.
 
 ## Console
 
@@ -169,35 +198,6 @@ log.Fatal(srv.ListenAndServe(":8080"))
 
 > [!WARNING]
 > The console endpoints are unauthenticated by design — localhost/dev only. Put them behind an auth proxy if exposed publicly, or use `--no-http`.
-
-## Outbox
-
-phylax can act as the **consumer half of the transactional outbox pattern**. Write your domain change and an outbox row in the *same* database transaction; phylax catches the outbox `insert` on the WAL, hands the row to your `DeliveryFunc` (typically a message broker publish), and acks it by setting `delivered_at`. Because the row only leaves the "pending" state after a successful delivery, a crash before the ack leaves it pending and it is **redelivered on resume** — at-least-once by design, so your `DeliveryFunc` must be idempotent.
-
-```go
-cdc, _ := phylax.New(phylax.Config{
-    DSN:         "postgres://user:pass@localhost:5432/db",
-    Tables:      []string{"users"},
-    OutboxTable: "outbox",
-})
-
-cdc.OnOutboxDelivery(func(ctx context.Context, row *phylax.OutboxRow) error {
-    return broker.Publish(ctx, row.Topic, row.Payload) // idempotent!
-})
-
-cdc.Start(ctx)
-```
-
-| Field / method          | Meaning                                                                                          |
-| ------------------------ | ------------------------------------------------------------------------------------------------ |
-| `Config.OutboxTable`     | table whose inserts are treated as outbox messages (default empty = feature off)                 |
-| `SetOutboxDelivery(fn)`  | the `DeliveryFunc`; an outbox insert returns early and never reaches `OnChange`                   |
-| `OutboxRow`              | `{ ID, Topic, Payload }` decoded from the inserted row                                |
-
-**Concurrency:** delivery is **asynchronous** so it never blocks the replication stream. Rows with the same `topic` are delivered **sequentially** (in receive order) while distinct topics run **in parallel**, capped by a semaphore. Failures retry with exponential backoff (1s → 16s, 5 attempts) before the row is left pending for the next run.
-
-> [!NOTE]
-> The acker uses its own database connection (not the shared admin connection) and serializes acks — a parallel drainer racing the admin connection would error with `conn busy`. The outbox `UPDATE` is atomic per statement; Postgres is never the bottleneck, the Go-concurrency discipline around `pgx.Conn` is.
 
 ## Understanding the change payload
 
@@ -241,7 +241,7 @@ Each trade-off is a choice, not an oversight — what you give up, why, and when
 
 | Limitation                                                                                                                                                                    | Why it's deliberate                                                              | When to outgrow it                                                     |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| **Best-effort delivery** — 3 webhook retries, then drop; no durable outbox                                                                                                     | Keeps memory bounded; the slot is the safety net (at-least-once)                   | Need exactly-once → add an outbox between phylax and the consumer        |
+| **Best-effort delivery** — 3 webhook retries, then drop; no durable outbox *for webhooks* | Keeps memory bounded; the slot is the safety net (at-least-once) | Need exactly-once for a broker → use the built-in [outbox](#outbox) (its own ack + retry) |
 | **Drop-on-full subscribers** — SSE subscribers hold a 10-event buffer (100 for the `OnChange` consumer); sizes are set in code at `Subscribe(id, size)` time, not via config; a full buffer drops the change (counted) | A subscriber must never stall the stream                                          | Consumers can't keep pace → speed them up or watch `changes_dropped`     |
 | **Ghost subscribers** — an SSE client that drops its connection without a clean close stays registered until the next write fails, so `subscribers` can lag reality while idle | Unsubscribe-on-write-error is simple and correct-enough                           | Need exact live counts → heartbeat or read-side EOF detection            |
 | **Delivery-bound, not decode-bound** — decode consumed 100% at every tested rate (up to ~37k changes/s); the walls are Postgres's commit rate and SSE fan-out ([Performance](#performance)) | Drops are the designed degradation path                                          | Sustained high write rates → batch SSE writes, go binary, or fan out consumers |
