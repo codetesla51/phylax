@@ -163,6 +163,20 @@ func (s *Server) NewSSEHandler(w http.ResponseWriter, r *http.Request) {
 	ch := s.broadcaster.Subscribe(subscriberID, 10)
 	defer s.broadcaster.Unsubscribe(subscriberID)
 
+	// Flush an immediate preamble so the client sees the response start
+	// (EventSource fires onopen) even when no changes are flowing. Without
+	// this, Go holds the headers back until the first write, and a quiet
+	// stream leaves the browser stuck in CONNECTING forever.
+	if _, err := w.Write([]byte(": connected\n\n")); err != nil {
+		return
+	}
+	flush.Flush()
+
+	// Heartbeat: an idle SSE connection can be reaped by browsers or
+	// proxies; a comment every 20s keeps it alive without noise.
+	heartbeat := time.NewTicker(20 * time.Second)
+	defer heartbeat.Stop()
+
 	for {
 		select {
 		case change := <-ch:
@@ -172,6 +186,11 @@ func (s *Server) NewSSEHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			_, err = w.Write([]byte("data: " + string(changeJSON) + "\n\n"))
 			if err != nil {
+				return
+			}
+			flush.Flush()
+		case <-heartbeat.C:
+			if _, err := w.Write([]byte(": ping\n\n")); err != nil {
 				return
 			}
 			flush.Flush()

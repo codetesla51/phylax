@@ -71,9 +71,21 @@ func TestServerEventsEndpoint(t *testing.T) {
 	}
 
 	reader := bufio.NewReader(resp.Body)
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		t.Fatalf("reading event: %v", err)
+	// Skip SSE comment lines (e.g. the ": connected" preamble and
+	// heartbeats) — clients ignore them, so the test should too.
+	var line string
+	for {
+		l, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("reading event: %v", err)
+		}
+		line = l
+		// Skip comment lines AND the blank line that ends a comment/event
+		// block — SSE clients ignore both.
+		if strings.HasPrefix(line, ": ") || line == "\n" {
+			continue
+		}
+		break
 	}
 	if !strings.HasPrefix(line, "data: ") {
 		t.Fatalf("not an SSE data event: %q", line)
