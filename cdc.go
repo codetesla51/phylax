@@ -47,12 +47,19 @@ type Config struct {
 	// Defaults to "my_publication" when empty.
 	PublicationName string
 
+	// ChangeBufferSize is the per-subscriber channel buffer used by
+	// OnChange. A slow consumer with a full buffer drops changes
+	// (counted in MetricsSnapshot.ChangesDropped) rather than stalling
+	// the stream, so size this for your biggest burst. Defaults to 100
+	// when <= 0. Each buffered change costs roughly a kilobyte.
+	ChangeBufferSize int
+
 	OutboxTable string
 }
 
 const (
-	// changeBufferSize is the per-subscriber channel buffer used by OnChange.
-	changeBufferSize = 100
+	// defaultChangeBufferSize fills in an empty Config.ChangeBufferSize.
+	defaultChangeBufferSize = 100
 
 	// defaultSlotName and defaultPublicationName fill in empty Config names.
 	defaultSlotName        = "my_slot"
@@ -87,6 +94,9 @@ func New(cfg Config) (*CDC, error) {
 	if cfg.PublicationName == "" {
 		cfg.PublicationName = defaultPublicationName
 	}
+	if cfg.ChangeBufferSize <= 0 {
+		cfg.ChangeBufferSize = defaultChangeBufferSize
+	}
 	return &CDC{
 		cfg:         cfg,
 		broadcaster: NewBroadcaster(),
@@ -104,7 +114,7 @@ func (c *CDC) OnChange(fn func(*Change)) {
 	c.subIDs[id] = struct{}{}
 	c.mu.Unlock()
 
-	ch := c.broadcaster.Subscribe(id, changeBufferSize)
+	ch := c.broadcaster.Subscribe(id, c.cfg.ChangeBufferSize)
 	go func() {
 		for change := range ch {
 			fn(change)

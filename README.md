@@ -149,7 +149,10 @@ cdc.OnChange(func(c *phylax.Change) {
 log.Fatal(cdc.Start(context.Background()))
 ```
 
-`Config` has five fields: `DSN` (required — no default), `Tables`, `SlotName` (default `my_slot`), `PublicationName` (default `my_publication`), and `OutboxTable` (optional — when set, inserts on that table are routed through the [outbox](#outbox) pipeline instead of to `OnChange`). Low-level tunables (heartbeat interval, per-connection URLs) live in `ClientConfig` / `DefaultClientConfig()`.
+`Config` has six fields: `DSN` (required — no default), `Tables`, `SlotName` (default `my_slot`), `PublicationName` (default `my_publication`), `ChangeBufferSize` (per-`OnChange`-subscriber channel buffer, default `100`), and `OutboxTable` (optional — when set, inserts on that table are routed through the [outbox](#outbox) pipeline instead of to `OnChange`). Low-level tunables (heartbeat interval, per-connection URLs) live in `ClientConfig` / `DefaultClientConfig()`.
+
+> [!NOTE]
+> `ChangeBufferSize` only needs raising when a consumer verifiably drops changes (`changes_dropped` climbing in the console) under bursty load — size it for the biggest burst, roughly 1KB per buffered change. A full buffer drops rather than stalls the stream, so this trades a little memory for burst headroom, not correctness.
 
 ## Outbox
 
